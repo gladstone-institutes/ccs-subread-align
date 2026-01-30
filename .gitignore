@@ -144,3 +144,6 @@ dmypy.json
 # Claude
 .claude/
 CLAUDE.md
+
+# Local dev only folder
+local_only/
