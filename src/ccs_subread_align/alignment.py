@@ -121,7 +121,11 @@ def parse_edlib_cigar_to_positions(
 
 
 def assign_subreads_to_strand(
-    subread_seq: str, ref_seq: str, chrM_length: int, min_identity: float = 0.5
+    subread_seq: str,
+    ref_seq: str,
+    chrM_length: int,
+    min_identity: float = 0.5,
+    report_margin: bool = False,
 ) -> Optional[Dict]:
     """
     Align subread in native and RC orientation to reference.
@@ -166,17 +170,20 @@ def assign_subreads_to_strand(
     else:
         position_map = np.full(len(best_seq), -1, dtype=np.int32)
 
-    return {
+    result = {
         "strand": strand,
         "aligned_sequence": best_seq,
         "position_map": position_map,
         "edit_distance": best_result["editDistance"],
         "identity": identity,
     }
+    if report_margin:
+        result["edit_distance_margin"] = abs(native_dist - rc_dist)
+    return result
 
 
 def _assign_single_subread(
-    subread_dict: Dict, chrM_length: int, min_identity: float
+    subread_dict: Dict, chrM_length: int, min_identity: float, report_margin: bool = False
 ) -> Optional[Dict]:
     """
     Worker function for parallel subread assignment.
@@ -193,11 +200,15 @@ def _assign_single_subread(
         return None
 
     assignment = assign_subreads_to_strand(
-        subread_dict["query_sequence"], subread_dict["_ref_seq"], chrM_length, min_identity
+        subread_dict["query_sequence"],
+        subread_dict["_ref_seq"],
+        chrM_length,
+        min_identity,
+        report_margin=report_margin,
     )
 
     if assignment:
-        return {
+        result = {
             "zmw": subread_dict["zmw"],
             "strand": assignment["strand"],
             "zmw_strand": f"{subread_dict['zmw']}_{assignment['strand']}",
@@ -206,6 +217,9 @@ def _assign_single_subread(
             "position_map": assignment["position_map"],
             "identity": assignment["identity"],
         }
+        if report_margin:
+            result["edit_distance_margin"] = assignment["edit_distance_margin"]
+        return result
     return None
 
 
@@ -217,6 +231,7 @@ def process_subread_alignment(
     chrM_length: int,
     min_identity: float,
     n_cores: Optional[int] = None,
+    report_margin: bool = False,
 ) -> List[Dict]:
     """
     Align subreads to reference and assign to strands.
@@ -262,6 +277,7 @@ def process_subread_alignment(
         _assign_single_subread,
         chrM_length=chrM_length,
         min_identity=min_identity,
+        report_margin=report_margin,
     )
 
     if n_cores == 1:

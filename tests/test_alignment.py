@@ -180,6 +180,12 @@ def test_assign_strand_fwd(ref_seq):
     assert result is not None
     assert result["strand"] == "fwd"
     assert result["identity"] == 1.0
+    assert "edit_distance_margin" not in result
+
+    # With report_margin=True, margin should be present
+    result_margin = assign_subreads_to_strand(subread, ref_seq, CHRM_LENGTH, report_margin=True)
+    assert result_margin is not None
+    assert result_margin["edit_distance_margin"] >= 0
 
 
 def test_assign_strand_rev(ref_seq):
@@ -189,6 +195,11 @@ def test_assign_strand_rev(ref_seq):
     assert result is not None
     assert result["strand"] == "rev"
     assert result["identity"] == 1.0
+    assert "edit_distance_margin" not in result
+
+    result_margin = assign_subreads_to_strand(subread, ref_seq, CHRM_LENGTH, report_margin=True)
+    assert result_margin is not None
+    assert result_margin["edit_distance_margin"] >= 0
 
 
 def test_assign_strand_low_identity(ref_seq):
@@ -240,6 +251,16 @@ def test_assign_single_subread_valid(ref_seq):
     assert result["strand"] in ("fwd", "rev")
     assert "zmw_strand" in result
     assert "identity" in result
+    assert "edit_distance_margin" not in result
+
+    result_margin = _assign_single_subread(
+        subread_dict,
+        chrM_length=CHRM_LENGTH,
+        min_identity=0.5,
+        report_margin=True,
+    )
+    assert result_margin is not None
+    assert result_margin["edit_distance_margin"] >= 0
 
 
 # --- Integration with real BAM data ---
@@ -258,10 +279,11 @@ def test_assign_real_subreads(ref_seq):
     aligned_count = 0
     for seq in subreads:
         if len(seq) >= 25:
-            result = assign_subreads_to_strand(seq, ref_seq, CHRM_LENGTH)
+            result = assign_subreads_to_strand(seq, ref_seq, CHRM_LENGTH, report_margin=True)
             if result is not None:
                 aligned_count += 1
                 assert result["strand"] in ("fwd", "rev")
                 assert 0.0 <= result["identity"] <= 1.0
+                assert result["edit_distance_margin"] >= 0
     # At least some subreads should align successfully
     assert aligned_count > 0
