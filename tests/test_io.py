@@ -4,7 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from ccs_subread_align.io import load_ccs_reads, load_reference, load_subreads
+import numpy as np
+import pandas as pd
+
+from ccs_subread_align.io import (
+    load_ccs_reads,
+    load_reference,
+    load_subreads,
+    read_parquet,
+    write_parquet,
+)
 
 DATA_DIR = Path(__file__).parent / "data"
 REF_FASTA = DATA_DIR / "hg38_chrM_circularized_by_doubling.fa"
@@ -132,3 +141,47 @@ def test_load_ccs_reads_has_reference_name(ccs_zmws):
     for read in reads:
         assert "reference_name" in read
         assert isinstance(read["reference_name"], str)
+
+
+# --- Parquet read/write ---
+
+
+@pytest.fixture
+def sample_composition_df():
+    """Create a sample composition DataFrame matching the package output schema."""
+    return pd.DataFrame(
+        {
+            "zmw": [1, 1, 2],
+            "strand": ["fwd", "fwd", "rev"],
+            "zmw_strand": ["1_fwd", "1_fwd", "2_rev"],
+            "ccs_pos": [0, 1, 0],
+            "ref_pos": [100, 101, 200],
+            "ccs_base": ["A", "T", "C"],
+            "reference_base": ["A", "T", "G"],
+            "q_score": np.array([30, 25, 40], dtype=np.int64),
+            "A_count": [5, 0, 1],
+            "T_count": [0, 5, 0],
+            "C_count": [0, 0, 4],
+            "G_count": [0, 0, 0],
+            "N_count": [0, 0, 0],
+            "total_subreads": [5, 5, 5],
+            "agreement_fraction": [1.0, 1.0, 0.8],
+        }
+    )
+
+
+def test_parquet_round_trip(tmp_path, sample_composition_df):
+    path = str(tmp_path / "test.parquet")
+    write_parquet(sample_composition_df, path)
+    result = read_parquet(path)
+    pd.testing.assert_frame_equal(result, sample_composition_df)
+
+
+def test_write_parquet_nonexistent_dir(sample_composition_df):
+    with pytest.raises((FileNotFoundError, OSError)):
+        write_parquet(sample_composition_df, "/nonexistent/dir/out.parquet")
+
+
+def test_read_parquet_nonexistent_file():
+    with pytest.raises((FileNotFoundError, OSError)):
+        read_parquet("/nonexistent/file.parquet")

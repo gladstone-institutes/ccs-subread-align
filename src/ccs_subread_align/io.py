@@ -1,10 +1,11 @@
-"""BAM/FASTA I/O functions for loading PacBio CCS reads and subreads."""
+"""I/O functions for loading PacBio CCS reads, subreads, and Parquet data."""
 
 import logging
 from collections import defaultdict
 from typing import Dict, List
 
 import numpy as np
+import pandas as pd
 import pysam
 
 from ccs_subread_align.alignment import extract_zmw_from_name, parse_cigar_to_reference_map
@@ -118,3 +119,28 @@ def load_subreads(
     total = sum(len(v) for v in subreads_by_zmw.values())
     logger.info(f"Loaded {total} subreads across {len(subreads_by_zmw)} ZMWs")
     return dict(subreads_by_zmw)
+
+
+def write_parquet(df: pd.DataFrame, path: str) -> None:
+    """Write a DataFrame to a Parquet file using pyarrow.
+
+    Args:
+        df: DataFrame to write
+        path: Output file path
+    """
+    df.to_parquet(path, engine="pyarrow", index=False)
+    logger.info(f"Wrote {len(df)} rows to: {path}")
+
+
+def read_parquet(path: str) -> pd.DataFrame:
+    """Read a Parquet file into a DataFrame using pyarrow.
+
+    Args:
+        path: Path to Parquet file
+
+    Returns:
+        DataFrame with the Parquet file contents
+    """
+    df = pd.read_parquet(path, engine="pyarrow")
+    logger.info(f"Read {len(df)} rows from: {path}")
+    return df

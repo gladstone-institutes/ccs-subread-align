@@ -14,7 +14,13 @@ from ccs_subread_align.composition import (
     calculate_all_base_compositions,
     calculate_base_composition,
 )
-from ccs_subread_align.io import load_ccs_reads, load_reference, load_subreads
+from ccs_subread_align.io import (
+    load_ccs_reads,
+    load_reference,
+    load_subreads,
+    read_parquet,
+    write_parquet,
+)
 
 __all__ = [
     "reverse_complement",
@@ -28,4 +34,6 @@ __all__ = [
     "load_ccs_reads",
     "load_reference",
     "load_subreads",
+    "read_parquet",
+    "write_parquet",
 ]
