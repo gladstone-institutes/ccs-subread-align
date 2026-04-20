@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ccs_subread_align"
-version = "0.2.0"
+version = "0.3.0"
 description = "Aligning PacBio subreads to their --by-strand CCS reads"
 authors = ["Natalie Gill"]
 license = "AGPL-3.0-only"
@@ -12,11 +12,11 @@ pysam = "*"
 edlib = "*"
 numpy = "*"
 tqdm = "*"
-aligntools = "*"
 pandas = ">=2.0,<3"
 pyarrow = "*"
 
 [tool.poetry.group.dev.dependencies]
+aligntools = "*"
 black = "*"
 pytest = "*"
 pytest-cov = "*"

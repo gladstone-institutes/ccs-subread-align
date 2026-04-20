@@ -1,16 +1,29 @@
 """I/O functions for loading PacBio CCS reads, subreads, and Parquet data."""
 
 import logging
+import resource
+import sys
+import time
 from collections import defaultdict
 from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 import pysam
+from tqdm import tqdm
 
 from ccs_subread_align.alignment import extract_zmw_from_name, parse_cigar_to_reference_map
 
 logger = logging.getLogger(__name__)
+
+
+def _peak_rss_mb() -> float:
+    """Peak RSS of the current process in MB.
+
+    ru_maxrss is bytes on macOS, kilobytes on Linux.
+    """
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return raw / (1024 * 1024) if sys.platform == "darwin" else raw / 1024
 
 
 def load_reference(fasta_path: str) -> Dict[str, str]:
@@ -30,10 +43,15 @@ def load_reference(fasta_path: str) -> Dict[str, str]:
 
 
 def load_ccs_reads(
-    ccs_bam_path: str, zmw_list: List[int], chrM_length: int
+    ccs_bam_path: str,
+    zmw_list: List[int],
+    chrM_length: int,
 ) -> List[Dict]:
     """
     Load CCS reads from BAM file.
+
+    Runs in two phases: (1) iterate the BAM and collect per-read fields,
+    (2) build a per-read int32 ``query_to_ref`` array from the CIGAR.
 
     Args:
         ccs_bam_path: Path to CCS BAM file
@@ -45,10 +63,13 @@ def load_ccs_reads(
     """
     logger.info(f"Loading CCS reads from: {ccs_bam_path}")
     zmw_set = set(zmw_list)
+    target_n = len(zmw_set)
     ccs_reads = []
 
+    logger.info(f"Phase 1: iterating BAM for {target_n} target ZMWs")
+    t0 = time.monotonic()
     with pysam.AlignmentFile(ccs_bam_path, "rb") as bam:
-        for read in bam.fetch():
+        for read in tqdm(bam.fetch(), desc="Phase 1: scanning BAM", unit="reads"):
             zmw = extract_zmw_from_name(read.query_name)
             if zmw in zmw_set:
                 strand = "rev" if read.is_reverse else "fwd"
@@ -74,15 +95,27 @@ def load_ccs_reads(
                     }
                 )
 
-    for ccs in ccs_reads:
-        if ccs["cigartuples"]:
-            ccs["query_to_ref_map"] = parse_cigar_to_reference_map(
-                ccs["cigartuples"], ccs["reference_start"], chrM_length
-            )
-        else:
-            ccs["query_to_ref_map"] = {}
+    k = len(ccs_reads)
+    logger.info(
+        f"Phase 1 complete: read {k}/{target_n} CCS records in "
+        f"{time.monotonic() - t0:.1f}s (peak RSS: {_peak_rss_mb():.0f} MB)"
+    )
 
-    logger.info(f"Loaded {len(ccs_reads)} CCS reads")
+    logger.info(f"Phase 2: building query→reference maps for {k} CCS reads")
+    t1 = time.monotonic()
+    for ccs in tqdm(ccs_reads, desc="Phase 2: CIGAR parse"):
+        ccs["query_to_ref"] = parse_cigar_to_reference_map(
+            ccs["cigartuples"],
+            ccs["reference_start"],
+            ccs["query_length"],
+            chrM_length,
+        )
+
+    logger.info(
+        f"Phase 2 complete in {time.monotonic() - t1:.1f}s "
+        f"(peak RSS: {_peak_rss_mb():.0f} MB)"
+    )
+    logger.info(f"Loaded {k} CCS reads")
     return ccs_reads
 
 
@@ -101,10 +134,17 @@ def load_subreads(
     """
     logger.info(f"Loading subreads from: {subreads_bam_path}")
     zmw_set = set(zmw_list)
+    target_n = len(zmw_set)
     subreads_by_zmw = defaultdict(list)
 
+    logger.info(f"Phase 1: iterating BAM for {target_n} target ZMWs")
+    t0 = time.monotonic()
     with pysam.AlignmentFile(subreads_bam_path, "rb", check_sq=False) as bam:
-        for read in bam.fetch(until_eof=True):
+        for read in tqdm(
+            bam.fetch(until_eof=True),
+            desc="Phase 1: scanning subreads BAM",
+            unit="reads",
+        ):
             zmw = extract_zmw_from_name(read.query_name)
             if zmw in zmw_set:
                 subreads_by_zmw[zmw].append(
@@ -117,6 +157,11 @@ def load_subreads(
                 )
 
     total = sum(len(v) for v in subreads_by_zmw.values())
+    logger.info(
+        f"Phase 1 complete: read {total} subreads across "
+        f"{len(subreads_by_zmw)} ZMWs in {time.monotonic() - t0:.1f}s "
+        f"(peak RSS: {_peak_rss_mb():.0f} MB)"
+    )
     logger.info(f"Loaded {total} subreads across {len(subreads_by_zmw)} ZMWs")
     return dict(subreads_by_zmw)
 

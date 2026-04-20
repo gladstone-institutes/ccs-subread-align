@@ -60,7 +60,7 @@ def test_load_ccs_reads_structure(ccs_zmws):
         "read_name",
         "query_sequence",
         "query_length",
-        "query_to_ref_map",
+        "query_to_ref",
     }
     for read in reads:
         assert required_keys.issubset(read.keys())
@@ -76,13 +76,15 @@ def test_load_ccs_reads_empty_zmw_list():
 
 
 @pytest.mark.skipif(not CCS_BAM.exists(), reason="Test BAM not available")
-def test_load_ccs_reads_query_to_ref_map(ccs_zmws):
+def test_load_ccs_reads_query_to_ref(ccs_zmws):
     reads = load_ccs_reads(str(CCS_BAM), ccs_zmws, CHRM_LENGTH)
     for read in reads:
-        ref_map = read["query_to_ref_map"]
-        for qpos, rpos in ref_map.items():
-            if rpos is not None:
-                assert 0 <= rpos < CHRM_LENGTH
+        arr = read["query_to_ref"]
+        assert isinstance(arr, np.ndarray)
+        assert arr.dtype == np.int32
+        assert arr.shape == (read["query_length"],)
+        valid = arr[arr >= 0]
+        assert (valid < CHRM_LENGTH).all()
 
 
 # --- load_subreads ---

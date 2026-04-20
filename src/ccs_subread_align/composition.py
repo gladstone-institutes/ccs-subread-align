@@ -30,7 +30,7 @@ def calculate_base_composition(
 
     Args:
         ccs_read: CCS read dictionary (from load_ccs_reads) with keys including
-            query_sequence, query_length, query_to_ref_map, quality_array, zmw,
+            query_sequence, query_length, query_to_ref, quality_array, zmw,
             strand, zmw_strand.
         assigned_subreads: List of assigned subread dicts (from process_subread_alignment)
             for this CCS read's (zmw, strand). Each must have aligned_sequence and
@@ -47,11 +47,7 @@ def calculate_base_composition(
 
     base_counts = np.zeros((ccs_len, 5), dtype=np.int32)
 
-    # Build CCS position -> reference position array
-    ccs_to_ref = np.full(ccs_len, -1, dtype=np.int32)
-    for ccs_pos, ref_pos in ccs_read["query_to_ref_map"].items():
-        if ref_pos is not None and 0 <= ccs_pos < ccs_len:
-            ccs_to_ref[ccs_pos] = ref_pos
+    ccs_to_ref = ccs_read["query_to_ref"]
 
     # Count bases from subreads at each CCS position
     for sr in assigned_subreads:

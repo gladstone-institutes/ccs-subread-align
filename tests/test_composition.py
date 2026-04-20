@@ -41,7 +41,9 @@ def _make_ccs_read(seq="ACGT", quality=None, zmw=1, strand="fwd", ref_start=0):
     """Build a minimal CCS read dict for testing."""
     if quality is None:
         quality = np.array([30] * len(seq))
-    query_to_ref = {i: (ref_start + i) % CHRM_LENGTH for i in range(len(seq))}
+    query_to_ref = np.array(
+        [(ref_start + i) % CHRM_LENGTH for i in range(len(seq))], dtype=np.int32
+    )
     return {
         "zmw": zmw,
         "strand": strand,
@@ -49,7 +51,7 @@ def _make_ccs_read(seq="ACGT", quality=None, zmw=1, strand="fwd", ref_start=0):
         "query_sequence": seq,
         "query_length": len(seq),
         "quality_array": quality,
-        "query_to_ref_map": query_to_ref,
+        "query_to_ref": query_to_ref,
     }
 
 
@@ -111,8 +113,8 @@ def test_base_composition_no_subreads():
 
 def test_base_composition_insertion_positions():
     ccs = _make_ccs_read("ACGT")
-    # Override: position 2 is an insertion (None -> -1)
-    ccs["query_to_ref_map"] = {0: 0, 1: 1, 2: None, 3: 3}
+    # Override: position 2 is an insertion (-1)
+    ccs["query_to_ref"] = np.array([0, 1, -1, 3], dtype=np.int32)
     sr = _make_subread("ACGT", [0, 1, -1, 3])
     ref_seq = "ACGT" * 5000
     df = calculate_base_composition(ccs, [sr], ref_seq, CHRM_LENGTH)

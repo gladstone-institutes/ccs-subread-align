@@ -8,23 +8,12 @@ from typing import Dict, List, Optional, Tuple
 
 import edlib
 import numpy as np
-from aligntools import Cigar
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-# pysam CIGAR operation codes to character mapping
-_PYSAM_OP_TO_CHAR = {
-    0: "M",
-    1: "I",
-    2: "D",
-    3: "N",
-    4: "S",
-    5: "H",
-    6: "P",
-    7: "=",
-    8: "X",
-}
+# Edlib/SAM CIGAR string tokenizer: "(length)(op)" pairs, e.g. "100=5X10I20=".
+_CIGAR_STR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
 
 
 def reverse_complement(seq: str) -> str:
@@ -44,45 +33,54 @@ def extract_zmw_from_name(read_name: str) -> Optional[int]:
     return None
 
 
-def _cigartuples_to_string(cigartuples) -> str:
-    """Convert pysam cigartuples to a CIGAR string."""
-    return "".join(
-        f"{length}{_PYSAM_OP_TO_CHAR[op]}" for op, length in cigartuples
-    )
-
-
 def parse_cigar_to_reference_map(
-    cigartuples, reference_start: int, chrM_length: int = 16569
-) -> Dict[int, Optional[int]]:
+    cigartuples,
+    reference_start: int,
+    query_length: int,
+    chrM_length: int = 16569,
+) -> np.ndarray:
     """
-    Parse CIGAR to create mapping from query positions to reference positions.
+    Parse CIGAR to map query positions to normalized reference positions.
 
-    Uses aligntools for CIGAR parsing with chrM_length normalization.
+    Walks the pysam cigartuples once, writing matched reference positions
+    directly into an int32 output array sized to ``query_length``.
+    Insertions, soft clips, hard clips, and padding leave the corresponding
+    query positions at -1. Reference positions are normalized modulo
+    ``chrM_length`` to handle the circularized (doubled) reference.
 
     Args:
         cigartuples: List of (operation, length) tuples from pysam
         reference_start: Starting reference position
+        query_length: Length of the query sequence (sets the array size)
         chrM_length: Actual mitochondrial genome length (default: 16569)
 
     Returns:
-        dict: Mapping from query positions to normalized reference positions
+        np.ndarray[int32] of shape (query_length,) with normalized reference
+        positions for matched bases and -1 for unmatched positions.
     """
-    cigar_str = _cigartuples_to_string(cigartuples)
-    cigar = Cigar.coerce(cigar_str)
-    mapping = cigar.coordinate_mapping
+    out = np.full(query_length, -1, dtype=np.int32)
+    if not cigartuples:
+        return out
 
-    query_to_ref = {}
-    for query_pos, ref_pos in mapping.query_to_ref.items():
-        normalized = (ref_pos + reference_start) % chrM_length
-        query_to_ref[query_pos] = normalized
+    q = 0  # query cursor
+    r = reference_start  # reference cursor
+    for op, length in cigartuples:
+        if op == 0 or op == 7 or op == 8:  # M / = / X: consume query + ref
+            end = q + length
+            if end > query_length:
+                end = query_length
+            seg = end - q
+            if seg > 0:
+                out[q:end] = (np.arange(r, r + seg) % chrM_length).astype(np.int32)
+            q += length
+            r += length
+        elif op == 1 or op == 4:  # I / S: consume query only
+            q += length
+        elif op == 2 or op == 3:  # D / N: consume ref only
+            r += length
+        # 5 (H), 6 (P): consume neither
 
-    # Mark insertion positions (query positions not in the mapping) as None
-    query_length = cigar.query_length
-    for qpos in range(query_length):
-        if qpos not in query_to_ref:
-            query_to_ref[qpos] = None
-
-    return query_to_ref
+    return out
 
 
 def parse_edlib_cigar_to_positions(
@@ -91,8 +89,10 @@ def parse_edlib_cigar_to_positions(
     """
     Parse edlib CIGAR string to map query positions to reference positions.
 
-    Uses aligntools for CIGAR parsing. Normalizes positions to actual mtDNA
-    coordinates (0 to chrM_length-1) using modulo.
+    Tokenizes the CIGAR string with a regex and walks it once, writing
+    matched reference positions into an int32 output array. Insertions and
+    soft clips stay at -1. Normalizes positions modulo ``chrM_length`` for
+    the circularized reference.
 
     Args:
         cigar: Edlib CIGAR string (e.g., "100=5X10I20=")
@@ -104,20 +104,31 @@ def parse_edlib_cigar_to_positions(
         np.array: Array mapping query positions to normalized reference positions
                   (-1 for gaps/insertions)
     """
+    qlen = len(query_seq)
+    out = np.full(qlen, -1, dtype=np.int32)
     if not cigar:
-        return np.full(len(query_seq), -1, dtype=np.int32)
+        return out
 
-    position_map = np.full(len(query_seq), -1, dtype=np.int32)
+    q = 0
+    r = ref_start
+    for length_str, op in _CIGAR_STR_RE.findall(cigar):
+        length = int(length_str)
+        if op == "M" or op == "=" or op == "X":
+            end = q + length
+            if end > qlen:
+                end = qlen
+            seg = end - q
+            if seg > 0:
+                out[q:end] = (np.arange(r, r + seg) % chrM_length).astype(np.int32)
+            q += length
+            r += length
+        elif op == "I" or op == "S":
+            q += length
+        elif op == "D" or op == "N":
+            r += length
+        # "H", "P": consume neither
 
-    parsed = Cigar.coerce(cigar)
-    mapping = parsed.coordinate_mapping
-
-    for query_pos, ref_pos in mapping.query_to_ref.items():
-        if query_pos < len(query_seq):
-            normalized = (ref_pos + ref_start) % chrM_length
-            position_map[query_pos] = normalized
-
-    return position_map
+    return out
 
 
 def assign_subreads_to_strand(

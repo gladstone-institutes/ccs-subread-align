@@ -6,7 +6,7 @@ version = "1.2.2"
 description = "A Python library for manipulation of CIGAR, MSA, and other alignment formats."
 optional = false
 python-versions = "*"
-groups = ["main"]
+groups = ["dev"]
 files = [
     {file = "aligntools-1.2.2-py2.py3-none-any.whl", hash = "sha256:015369c567e7abcef75dc6454b9a80126345468c95d408518ff471e71f0e6b11"},
     {file = "aligntools-1.2.2.tar.gz", hash = "sha256:3d54f5603735daab059e93068642933390326992419ce2d0af4ed11689db7345"},
@@ -3548,4 +3548,4 @@ test = ["pytest", "websockets"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "c514ff58b6628c58091708f0ecd94083a55430cede6e9eed05d553cd53d08ecd"
+content-hash = "324c4b5d2f21474ecc00108055e5185f06be6c3bd650db04c20b92dd94af60c1"
