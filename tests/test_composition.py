@@ -176,3 +176,111 @@ def test_calculate_all_base_compositions_integration():
     covered = df[df["total_subreads"] > 0]
     assert len(covered) > 0
     assert covered["agreement_fraction"].mean() > 0.8
+
+
+@pytest.mark.skipif(
+    not all(p.exists() for p in [CCS_BAM, SUBREADS_BAM, REF_FASTA]),
+    reason="Test data not available",
+)
+def test_calculate_all_base_compositions_streaming(tmp_path):
+    """Streaming output mode must produce identical rows to the in-memory path."""
+    from ccs_subread_align.alignment import process_subread_alignment
+    from ccs_subread_align.io import load_ccs_reads, load_reference, load_subreads
+
+    ref_seqs = load_reference(str(REF_FASTA))
+
+    import pysam
+
+    zmws = set()
+    with pysam.AlignmentFile(str(CCS_BAM), "rb") as bam:
+        for read in bam.fetch():
+            parts = read.query_name.split("/")
+            if len(parts) >= 2:
+                try:
+                    zmws.add(int(parts[1]))
+                except ValueError:
+                    pass
+    zmw_list = sorted(zmws)
+
+    ccs_reads = load_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH)
+    subreads_by_zmw = load_subreads(str(SUBREADS_BAM), zmw_list)
+    zmw_to_chrom = {ccs["zmw"]: ccs["reference_name"] for ccs in ccs_reads}
+
+    assigned = process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=2,
+    )
+
+    df_mem = calculate_all_base_compositions(
+        ccs_reads, assigned, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
+    )
+
+    out_path = tmp_path / "composition.parquet"
+    returned = calculate_all_base_compositions(
+        ccs_reads, assigned, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
+        output_path=out_path,
+    )
+
+    assert returned == out_path
+    assert out_path.exists()
+
+    df_stream = pd.read_parquet(out_path)
+    assert len(df_stream) == len(df_mem)
+    assert set(df_stream.columns) == set(df_mem.columns)
+
+    # Sort both sides to handle non-deterministic pool ordering, then compare values.
+    sort_cols = ["zmw", "strand", "ccs_pos"]
+    left = df_mem.sort_values(sort_cols).reset_index(drop=True)
+    right = df_stream.sort_values(sort_cols).reset_index(drop=True)
+    for col in sort_cols + ["ref_pos", "A_count", "T_count", "C_count", "G_count",
+                            "N_count", "total_subreads"]:
+        assert (left[col].to_numpy() == right[col].to_numpy()).all(), col
+    assert np.allclose(
+        left["agreement_fraction"].to_numpy(),
+        right["agreement_fraction"].to_numpy(),
+        equal_nan=True,
+    )
+    for col in ["ccs_base", "reference_base"]:
+        assert (
+            left[col].astype(str).to_numpy() == right[col].astype(str).to_numpy()
+        ).all(), col
+
+
+def test_streaming_empty_result(tmp_path):
+    """When no CCS reads survive filtering, no parquet file should be created."""
+    out_path = tmp_path / "empty.parquet"
+    returned = calculate_all_base_compositions(
+        ccs_reads=[],
+        assigned_subreads=[],
+        ref_seqs={"chrM": "ACGT" * 5000},
+        zmw_to_chrom={},
+        chrM_length=CHRM_LENGTH,
+        n_cores=1,
+        output_path=out_path,
+    )
+    assert returned == out_path
+    assert not out_path.exists()
+
+
+def test_streaming_small_synthetic(tmp_path):
+    """Streaming path works with n_cores=1 and a handful of reads."""
+    ccs1 = _make_ccs_read("ACGTACGT", zmw=1, strand="fwd")
+    ccs2 = _make_ccs_read("TTTTAAAA", zmw=2, strand="rev")
+    sr1 = _make_subread("ACGTACGT", [0, 1, 2, 3, 4, 5, 6, 7], zmw=1, strand="fwd")
+    sr2 = _make_subread("TTTTAAAA", [0, 1, 2, 3, 4, 5, 6, 7], zmw=2, strand="rev")
+    ref_seq = "ACGT" * 5000
+    out_path = tmp_path / "small.parquet"
+    returned = calculate_all_base_compositions(
+        ccs_reads=[ccs1, ccs2],
+        assigned_subreads=[sr1, sr2],
+        ref_seqs={"chrM": ref_seq},
+        zmw_to_chrom={1: "chrM", 2: "chrM"},
+        chrM_length=CHRM_LENGTH,
+        n_cores=1,
+        output_path=out_path,
+    )
+    assert returned == out_path
+    assert out_path.exists()
+    df = pd.read_parquet(out_path)
+    assert EXPECTED_COLUMNS == set(df.columns)
+    assert len(df) == 16  # 2 reads × 8 positions

@@ -46,10 +46,27 @@ assigned = process_subread_alignment(
     chrM_length=chrM_length, min_identity=0.5,
 )
 
-# Compute per-position base composition
+# Compute per-position base composition (in-memory DataFrame)
 composition_df = calculate_all_base_compositions(
     ccs_reads, assigned, ref_seqs, zmw_to_chrom, chrM_length=chrM_length,
 )
+```
+
+For full-scale jobs the concatenated DataFrame can exceed available memory
+(the 15-column frame is dominated by repeated string values that bloat to
+hundreds of GB across ~10⁹ rows). Pass `output_path=` to stream each
+per-CCS result to a zstd-compressed Parquet file instead and get the path
+back:
+
+```python
+out = calculate_all_base_compositions(
+    ccs_reads, assigned, ref_seqs, zmw_to_chrom,
+    chrM_length=chrM_length,
+    output_path="composition.parquet",
+)
+# read it back lazily on the consumer side
+import pandas as pd
+df = pd.read_parquet(out)
 ```
 
 ## License
