@@ -284,3 +284,68 @@ def test_streaming_small_synthetic(tmp_path):
     df = pd.read_parquet(out_path)
     assert EXPECTED_COLUMNS == set(df.columns)
     assert len(df) == 16  # 2 reads × 8 positions
+
+
+@pytest.mark.skipif(
+    not all(p.exists() for p in [CCS_BAM, SUBREADS_BAM, REF_FASTA]),
+    reason="Test data not available",
+)
+def test_calculate_all_base_compositions_from_parquet(tmp_path):
+    """Piping streamed alignment parquet into composition must equal the in-memory path."""
+    from ccs_subread_align.alignment import process_subread_alignment
+    from ccs_subread_align.io import load_ccs_reads, load_reference, load_subreads
+
+    ref_seqs = load_reference(str(REF_FASTA))
+
+    import pysam
+
+    zmws = set()
+    with pysam.AlignmentFile(str(CCS_BAM), "rb") as bam:
+        for read in bam.fetch():
+            parts = read.query_name.split("/")
+            if len(parts) >= 2:
+                try:
+                    zmws.add(int(parts[1]))
+                except ValueError:
+                    pass
+    zmw_list = sorted(zmws)
+
+    ccs_reads = load_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH)
+    subreads_by_zmw = load_subreads(str(SUBREADS_BAM), zmw_list)
+    zmw_to_chrom = {ccs["zmw"]: ccs["reference_name"] for ccs in ccs_reads}
+
+    # Legacy path: in-memory List[Dict].
+    assigned_list = process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=2,
+    )
+    df_from_list = calculate_all_base_compositions(
+        ccs_reads, assigned_list, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
+    )
+
+    # Streaming path: parquet round-trip.
+    aligned_parquet = tmp_path / "aligned.parquet"
+    process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=2, output_path=aligned_parquet,
+    )
+    df_from_parquet = calculate_all_base_compositions(
+        ccs_reads, aligned_parquet, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
+    )
+
+    assert len(df_from_parquet) == len(df_from_list)
+    assert set(df_from_parquet.columns) == set(df_from_list.columns)
+
+    sort_cols = ["zmw", "strand", "ccs_pos"]
+    left = df_from_list.sort_values(sort_cols).reset_index(drop=True)
+    right = df_from_parquet.sort_values(sort_cols).reset_index(drop=True)
+    for col in sort_cols + [
+        "ref_pos", "A_count", "T_count", "C_count", "G_count", "N_count",
+        "total_subreads",
+    ]:
+        assert (left[col].to_numpy() == right[col].to_numpy()).all(), col
+    assert np.allclose(
+        left["agreement_fraction"].to_numpy(),
+        right["agreement_fraction"].to_numpy(),
+        equal_nan=True,
+    )

@@ -2,6 +2,13 @@
 
 <!--next-version-placeholder-->
 
+## v0.5.0 (22/04/2026)
+
+- `process_subread_alignment` gains an optional `output_path=` kwarg. When provided, assigned-subread records are streamed to a zstd-compressed Parquet file via `pyarrow.parquet.ParquetWriter` (100k-row flush buffer) and the function returns the path instead of a `List[Dict]`. Schema: `zmw:int64`, `strand:dict<string>`, `subread_name:string`, `aligned_sequence:string`, `position_map:list<int32>`, `identity:float32`, plus `edit_distance_margin:int32` when `report_margin=True`. Avoids materializing the tens-of-GB `results` list that drove the parent process over 30 GB before pool fork.
+- `calculate_all_base_compositions` now accepts a Parquet path for `assigned_subreads` (in addition to the legacy `List[Dict]`). The parquet loads as a pyarrow Table and is sliced per `(zmw, strand)` group; groups are converted to `List[Dict]` just-in-time inside the work-items generator so only one group is materialized at a time.
+- `calculate_all_base_compositions` no longer builds a full `work_items: List[Tuple]` in the parent. The filter loop is a generator (`_iter_work_items`) fed directly to `pool.imap`, with a cheap pre-count supplying the tqdm total.
+- Both pools now use `multiprocessing.get_context("forkserver")` on POSIX (falling back to `spawn` on Windows) with `maxtasksperchild=200`. Workers fork from a tiny bootstrap process rather than the bloated parent, eliminating the ENOMEM failure at pool-creation time on Linux. Introduced `ccs_subread_align._pool.get_pool` as the shared factory.
+
 ## v0.4.0 (21/04/2026)
 
 - `calculate_all_base_compositions` gains an optional `output_path=` kwarg. When provided, per-CCS results are streamed to a zstd-compressed Parquet file via `pyarrow.parquet.ParquetWriter` (1M-row flush buffer) and the function returns the path instead of a `DataFrame`. Avoids the in-memory `pd.concat` that OOMs full-scale jobs (~1.69B rows → ~450 GB of which ~340 GB is object-dtype string columns). Omit the kwarg to keep the existing in-memory return.

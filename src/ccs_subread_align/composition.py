@@ -2,15 +2,17 @@
 
 import logging
 from collections import defaultdict
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
+
+from ccs_subread_align._pool import get_pool
 
 logger = logging.getLogger(__name__)
 
@@ -143,22 +145,72 @@ def _process_ccs_composition(args: Tuple) -> Optional[pd.DataFrame]:
 
 
 def _iter_worker_dfs(
-    work_items: List[Tuple],
+    work_items: Iterable[Tuple],
     n_cores: int,
 ) -> Iterable[Optional[pd.DataFrame]]:
     if n_cores == 1:
         for item in work_items:
             yield _process_ccs_composition(item)
     else:
-        with Pool(processes=n_cores) as pool:
+        with get_pool(n_cores) as pool:
             yield from pool.imap(
                 _process_ccs_composition, work_items, chunksize=10
             )
 
 
+def _group_subreads_from_parquet(
+    path: Union[str, Path],
+) -> Dict[Tuple[int, str], pa.Table]:
+    """Load a streamed-alignment parquet and group rows by (zmw, strand).
+
+    Rows are sliced from the single in-memory pyarrow Table; each group value
+    is a lightweight zero-copy view, not a new buffer. Using pyarrow here
+    keeps the per-row overhead ~5-10x smaller than rebuilding a ``List[Dict]``
+    of Python objects.
+    """
+    table = pq.read_table(str(path))
+    zmws = table.column("zmw").to_numpy(zero_copy_only=False)
+    strands = table.column("strand").to_pylist()
+    groups: Dict[Tuple[int, str], List[int]] = defaultdict(list)
+    for i, (z, s) in enumerate(zip(zmws, strands)):
+        groups[(int(z), s)].append(i)
+    result: Dict[Tuple[int, str], pa.Table] = {}
+    for key, idxs in groups.items():
+        result[key] = table.take(pa.array(idxs, type=pa.int64()))
+    return result
+
+
+def _pa_table_to_subread_dicts(table: pa.Table) -> List[Dict]:
+    """Materialize a per-group pyarrow Table as the List[Dict] the worker expects.
+
+    Short-lived: produced inside the work_items generator and consumed
+    immediately by ``_process_ccs_composition`` in a worker process.
+    """
+    aligned = table.column("aligned_sequence").to_pylist()
+    pos_maps = table.column("position_map").to_pylist()
+    subread_names = table.column("subread_name").to_pylist()
+    zmws = table.column("zmw").to_pylist()
+    strands = table.column("strand").to_pylist()
+    identities = table.column("identity").to_pylist()
+    out: List[Dict] = []
+    for i in range(table.num_rows):
+        out.append(
+            {
+                "zmw": int(zmws[i]),
+                "strand": strands[i],
+                "zmw_strand": f"{int(zmws[i])}_{strands[i]}",
+                "subread_name": subread_names[i],
+                "aligned_sequence": aligned[i],
+                "position_map": np.asarray(pos_maps[i], dtype=np.int32),
+                "identity": identities[i],
+            }
+        )
+    return out
+
+
 def calculate_all_base_compositions(
     ccs_reads: List[Dict],
-    assigned_subreads: List[Dict],
+    assigned_subreads: Union[List[Dict], str, Path],
     ref_seqs: Dict[str, str],
     zmw_to_chrom: Dict[int, str],
     chrM_length: int = 16569,
@@ -170,7 +222,11 @@ def calculate_all_base_compositions(
 
     Args:
         ccs_reads: List of CCS read dictionaries (from load_ccs_reads).
-        assigned_subreads: List of assigned subread dicts (from process_subread_alignment).
+        assigned_subreads: Either a ``List[Dict]`` of assigned subread records
+            (legacy in-memory path) or a path to a parquet file written by
+            ``process_subread_alignment(..., output_path=...)``. The parquet
+            path is preferred at full scale: it loads as a pyarrow Table with
+            tight columnar dtypes instead of a fat Python list of dicts.
         ref_seqs: Dictionary mapping chromosome names to reference sequences.
         zmw_to_chrom: Dictionary mapping ZMW to chromosome name.
         chrM_length: Genome length for coordinate normalization.
@@ -187,28 +243,47 @@ def calculate_all_base_compositions(
     if n_cores is None:
         n_cores = cpu_count()
 
-    subreads_by_zmw_strand: Dict[Tuple[int, str], List[Dict]] = defaultdict(list)
-    for sr in assigned_subreads:
-        subreads_by_zmw_strand[(sr["zmw"], sr["strand"])].append(sr)
+    subreads_by_zmw_strand: Dict[Tuple[int, str], Union[List[Dict], pa.Table]]
+    from_parquet = isinstance(assigned_subreads, (str, Path))
+    if from_parquet:
+        subreads_by_zmw_strand = _group_subreads_from_parquet(assigned_subreads)
+    else:
+        grouped: Dict[Tuple[int, str], List[Dict]] = defaultdict(list)
+        for sr in assigned_subreads:
+            grouped[(sr["zmw"], sr["strand"])].append(sr)
+        subreads_by_zmw_strand = grouped
 
     logger.info(f"{len(subreads_by_zmw_strand)} unique (zmw, strand) groups")
 
-    work_items: List[Tuple] = []
-    for ccs in ccs_reads:
-        chrom = zmw_to_chrom.get(ccs["zmw"])
-        if chrom is None or chrom not in ref_seqs:
-            continue
-        matched_subreads = subreads_by_zmw_strand.get((ccs["zmw"], ccs["strand"]), [])
-        work_items.append((ccs, matched_subreads, ref_seqs[chrom], chrM_length))
+    # Pre-count eligible CCS reads so tqdm can show a real total without
+    # materializing the work_items list itself.
+    n_work_items = sum(
+        1 for ccs in ccs_reads if zmw_to_chrom.get(ccs["zmw"]) in ref_seqs
+    )
+
+    def _iter_work_items() -> Iterator[Tuple]:
+        for ccs in ccs_reads:
+            chrom = zmw_to_chrom.get(ccs["zmw"])
+            if chrom is None or chrom not in ref_seqs:
+                continue
+            key = (ccs["zmw"], ccs["strand"])
+            group = subreads_by_zmw_strand.get(key)
+            if group is None:
+                matched: List[Dict] = []
+            elif from_parquet:
+                matched = _pa_table_to_subread_dicts(group)
+            else:
+                matched = group
+            yield (ccs, matched, ref_seqs[chrom], chrM_length)
 
     logger.info(
-        f"Calculating base composition for {len(work_items)} CCS reads using {n_cores} cores"
+        f"Calculating base composition for {n_work_items} CCS reads using {n_cores} cores"
     )
 
     desc = f"Processing CCS reads ({n_cores} cores)" if n_cores != 1 else "Processing CCS reads"
     df_iter = tqdm(
-        _iter_worker_dfs(work_items, n_cores),
-        total=len(work_items),
+        _iter_worker_dfs(_iter_work_items(), n_cores),
+        total=n_work_items,
         desc=desc,
     )
 

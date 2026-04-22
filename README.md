@@ -69,6 +69,21 @@ import pandas as pd
 df = pd.read_parquet(out)
 ```
 
+The alignment stage has the same knob: `process_subread_alignment(..., output_path=...)` streams assigned-subread records to Parquet and returns the path instead of a `List[Dict]`. `calculate_all_base_compositions` accepts that Parquet path directly in place of the list, so a full-scale run keeps both the tens-of-GB assignments and the ~10⁹-row composition frame off the heap:
+
+```python
+process_subread_alignment(
+    zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom,
+    chrM_length=chrM_length, min_identity=0.5,
+    output_path="aligned.parquet",
+)
+calculate_all_base_compositions(
+    ccs_reads, "aligned.parquet", ref_seqs, zmw_to_chrom,
+    chrM_length=chrM_length,
+    output_path="composition.parquet",
+)
+```
+
 ## License
 
 `ccs_subread_align` was created by Natalie Gill. It is licensed under the terms of the AGPL-3.0 license.

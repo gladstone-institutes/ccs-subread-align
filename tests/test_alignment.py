@@ -431,3 +431,120 @@ def test_assign_real_subreads(ref_seq):
                 assert result["edit_distance_margin"] >= 0
     # At least some subreads should align successfully
     assert aligned_count > 0
+
+
+# --- process_subread_alignment streaming ---
+
+
+def _load_full_bam_inputs():
+    from ccs_subread_align.io import load_ccs_reads, load_reference, load_subreads
+
+    ref_seqs = load_reference(str(REF_FASTA))
+
+    zmws = set()
+    with pysam.AlignmentFile(str(CCS_BAM), "rb") as bam:
+        for read in bam.fetch():
+            parts = read.query_name.split("/")
+            if len(parts) >= 2:
+                try:
+                    zmws.add(int(parts[1]))
+                except ValueError:
+                    pass
+    zmw_list = sorted(zmws)
+
+    ccs_reads = load_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH)
+    subreads_by_zmw = load_subreads(str(SUBREADS_BAM), zmw_list)
+    zmw_to_chrom = {ccs["zmw"]: ccs["reference_name"] for ccs in ccs_reads}
+    return ref_seqs, zmw_list, ccs_reads, subreads_by_zmw, zmw_to_chrom
+
+
+@pytest.mark.skipif(
+    not all(p.exists() for p in [CCS_BAM, SUBREADS_BAM, REF_FASTA]),
+    reason="Test data not available",
+)
+def test_process_subread_alignment_streaming(tmp_path):
+    """Streaming output must match the legacy List[Dict] path row-for-row."""
+    import pyarrow.parquet as pq
+
+    from ccs_subread_align.alignment import process_subread_alignment
+
+    ref_seqs, zmw_list, _, subreads_by_zmw, zmw_to_chrom = _load_full_bam_inputs()
+
+    assigned = process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=2,
+    )
+
+    out_path = tmp_path / "aligned.parquet"
+    returned = process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=2, output_path=out_path,
+    )
+
+    assert returned == out_path
+    assert out_path.exists()
+
+    table = pq.read_table(out_path)
+    assert table.num_rows == len(assigned)
+    assert set(table.column_names) == {
+        "zmw", "strand", "subread_name", "aligned_sequence", "position_map", "identity",
+    }
+
+    # Compare row-by-row on subread_name (unique per subread) to sidestep pool order.
+    by_name_legacy = {r["subread_name"]: r for r in assigned}
+    names = table.column("subread_name").to_pylist()
+    aligned_col = table.column("aligned_sequence").to_pylist()
+    strands = table.column("strand").to_pylist()
+    pos_maps = table.column("position_map").to_pylist()
+    zmws = table.column("zmw").to_pylist()
+    for i, name in enumerate(names):
+        ref = by_name_legacy[name]
+        assert strands[i] == ref["strand"]
+        assert int(zmws[i]) == int(ref["zmw"])
+        assert aligned_col[i] == ref["aligned_sequence"]
+        np.testing.assert_array_equal(
+            np.asarray(pos_maps[i], dtype=np.int32), ref["position_map"]
+        )
+
+
+@pytest.mark.skipif(
+    not all(p.exists() for p in [CCS_BAM, SUBREADS_BAM, REF_FASTA]),
+    reason="Test data not available",
+)
+def test_process_subread_alignment_streaming_with_margin(tmp_path):
+    """report_margin=True must round-trip through the parquet schema."""
+    import pyarrow.parquet as pq
+
+    from ccs_subread_align.alignment import process_subread_alignment
+
+    ref_seqs, zmw_list, _, subreads_by_zmw, zmw_to_chrom = _load_full_bam_inputs()
+
+    out_path = tmp_path / "aligned_margin.parquet"
+    process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=1, output_path=out_path, report_margin=True,
+    )
+
+    table = pq.read_table(out_path)
+    assert "edit_distance_margin" in table.column_names
+    margins = table.column("edit_distance_margin").to_pylist()
+    assert all(m >= 0 for m in margins)
+
+
+def test_process_subread_alignment_streaming_empty(tmp_path):
+    """No subreads → no parquet file written, but path is still returned."""
+    from ccs_subread_align.alignment import process_subread_alignment
+
+    out_path = tmp_path / "empty.parquet"
+    returned = process_subread_alignment(
+        zmw_list=[],
+        subreads_by_zmw={},
+        ref_seqs={"chrM": "ACGT" * 5000},
+        zmw_to_chrom={},
+        chrM_length=CHRM_LENGTH,
+        min_identity=0.5,
+        n_cores=1,
+        output_path=out_path,
+    )
+    assert returned == out_path
+    assert not out_path.exists()

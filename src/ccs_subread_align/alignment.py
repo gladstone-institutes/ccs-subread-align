@@ -3,14 +3,40 @@
 import logging
 import re
 from functools import partial
-from multiprocessing import Pool, cpu_count
-from typing import Dict, List, Optional, Tuple
+from multiprocessing import cpu_count
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import edlib
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from tqdm import tqdm
 
+from ccs_subread_align._pool import get_pool
+
 logger = logging.getLogger(__name__)
+
+# Row buffer flush threshold for streaming assigned-subread parquet output.
+# Alignment rows carry variable-length aligned_sequence + position_map,
+# so use a smaller buffer than the composition-side 1M-row value.
+_ASSIGNED_SUBREAD_FLUSH_ROWS = 100_000
+
+_ASSIGNED_SUBREAD_SCHEMA = pa.schema(
+    [
+        pa.field("zmw", pa.int64()),
+        pa.field("strand", pa.dictionary(pa.int8(), pa.string())),
+        pa.field("subread_name", pa.string()),
+        pa.field("aligned_sequence", pa.string()),
+        pa.field("position_map", pa.list_(pa.int32())),
+        pa.field("identity", pa.float32()),
+    ]
+)
+
+_ASSIGNED_SUBREAD_SCHEMA_MARGIN = pa.schema(
+    list(_ASSIGNED_SUBREAD_SCHEMA)
+    + [pa.field("edit_distance_margin", pa.int32())]
+)
 
 # Edlib/SAM CIGAR string tokenizer: "(length)(op)" pairs, e.g. "100=5X10I20=".
 _CIGAR_STR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
@@ -234,6 +260,51 @@ def _assign_single_subread(
     return None
 
 
+def _iter_worker_results(
+    all_subreads: List[Dict],
+    worker,
+    n_cores: int,
+    total: int,
+) -> Iterable[Optional[Dict]]:
+    """Yield worker outputs one-at-a-time; never materializes the full list."""
+    if n_cores == 1:
+        for sr in tqdm(all_subreads, total=total, desc="Assigning subreads"):
+            yield worker(sr)
+    else:
+        with get_pool(n_cores) as pool:
+            yield from tqdm(
+                pool.imap(worker, all_subreads, chunksize=50),
+                total=total,
+                desc=f"Assigning subreads ({n_cores} cores)",
+            )
+
+
+def _assigned_batch_to_table(batch: List[Dict], report_margin: bool) -> pa.Table:
+    """Convert a buffer of assignment dicts into a pyarrow Table matching the schema."""
+    zmws = [int(r["zmw"]) for r in batch]
+    strands = [r["strand"] for r in batch]
+    subread_names = [r["subread_name"] for r in batch]
+    aligned = [r["aligned_sequence"] for r in batch]
+    pos_maps = [np.asarray(r["position_map"], dtype=np.int32).tolist() for r in batch]
+    identities = [float(r["identity"]) for r in batch]
+
+    cols = {
+        "zmw": pa.array(zmws, type=pa.int64()),
+        "strand": pa.array(strands, type=pa.string()).dictionary_encode(),
+        "subread_name": pa.array(subread_names, type=pa.string()),
+        "aligned_sequence": pa.array(aligned, type=pa.string()),
+        "position_map": pa.array(pos_maps, type=pa.list_(pa.int32())),
+        "identity": pa.array(identities, type=pa.float32()),
+    }
+    schema = _ASSIGNED_SUBREAD_SCHEMA
+    if report_margin:
+        cols["edit_distance_margin"] = pa.array(
+            [int(r["edit_distance_margin"]) for r in batch], type=pa.int32()
+        )
+        schema = _ASSIGNED_SUBREAD_SCHEMA_MARGIN
+    return pa.Table.from_pydict(cols, schema=schema)
+
+
 def process_subread_alignment(
     zmw_list: List[int],
     subreads_by_zmw: Dict[int, List[Dict]],
@@ -243,7 +314,8 @@ def process_subread_alignment(
     min_identity: float,
     n_cores: Optional[int] = None,
     report_margin: bool = False,
-) -> List[Dict]:
+    output_path: Optional[Union[str, Path]] = None,
+) -> Union[List[Dict], Path]:
     """
     Align subreads to reference and assign to strands.
 
@@ -255,9 +327,15 @@ def process_subread_alignment(
         chrM_length: Mitochondrial genome length
         min_identity: Minimum alignment identity
         n_cores: Number of cores for parallel processing
+        report_margin: If True, include ``edit_distance_margin`` in each result.
+        output_path: If provided, stream assigned-subread records straight to
+            this zstd-compressed parquet file and return the path. Avoids
+            materializing the full ``List[Dict]`` of assignments, which can
+            reach tens of GB at full scale. If None, return the legacy
+            ``List[Dict]`` (safe only at small scale).
 
     Returns:
-        List of assigned subread dictionaries
+        List of assigned subread dictionaries, or ``output_path`` if streaming.
     """
     if n_cores is None:
         n_cores = cpu_count()
@@ -282,7 +360,8 @@ def process_subread_alignment(
             f"{skipped_zmws}"
         )
 
-    logger.info(f"Assigning {len(all_subreads)} subreads using {n_cores} cores")
+    total = len(all_subreads)
+    logger.info(f"Assigning {total} subreads using {n_cores} cores")
 
     worker = partial(
         _assign_single_subread,
@@ -291,19 +370,60 @@ def process_subread_alignment(
         report_margin=report_margin,
     )
 
-    if n_cores == 1:
-        results = [worker(sr) for sr in tqdm(all_subreads, desc="Assigning subreads")]
-    else:
-        with Pool(processes=n_cores) as pool:
-            results = list(
-                tqdm(
-                    pool.imap(worker, all_subreads, chunksize=50),
-                    total=len(all_subreads),
-                    desc=f"Assigning subreads ({n_cores} cores)",
-                )
-            )
+    result_iter = _iter_worker_results(all_subreads, worker, n_cores, total)
 
-    assigned = [r for r in results if r is not None]
+    if output_path is not None:
+        output_path = Path(output_path)
+        schema = (
+            _ASSIGNED_SUBREAD_SCHEMA_MARGIN if report_margin else _ASSIGNED_SUBREAD_SCHEMA
+        )
+        writer: Optional[pq.ParquetWriter] = None
+        buffer: List[Dict] = []
+        n_fwd = n_rev = 0
+        total_written = 0
+        try:
+            for r in result_iter:
+                if r is None:
+                    continue
+                if r["strand"] == "fwd":
+                    n_fwd += 1
+                else:
+                    n_rev += 1
+                buffer.append(r)
+                if len(buffer) >= _ASSIGNED_SUBREAD_FLUSH_ROWS:
+                    table = _assigned_batch_to_table(buffer, report_margin)
+                    if writer is None:
+                        writer = pq.ParquetWriter(
+                            output_path, schema, compression="zstd"
+                        )
+                    writer.write_table(table)
+                    total_written += table.num_rows
+                    buffer.clear()
+            if buffer:
+                table = _assigned_batch_to_table(buffer, report_margin)
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        output_path, schema, compression="zstd"
+                    )
+                writer.write_table(table)
+                total_written += table.num_rows
+                buffer.clear()
+        finally:
+            if writer is not None:
+                writer.close()
+
+        if writer is None:
+            logger.info(
+                f"No subreads assigned; no parquet written to {output_path}"
+            )
+        else:
+            logger.info(
+                f"Streamed {total_written} assigned subreads "
+                f"(fwd={n_fwd}, rev={n_rev}) to: {output_path}"
+            )
+        return output_path
+
+    assigned = [r for r in result_iter if r is not None]
     logger.info(
         f"Assigned {len(assigned)} subreads "
         f"(fwd={sum(1 for s in assigned if s['strand'] == 'fwd')}, "
