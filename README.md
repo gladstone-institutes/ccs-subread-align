@@ -21,24 +21,25 @@ poetry install
 ```python
 from ccs_subread_align import (
     load_reference,
-    load_ccs_reads,
     load_subreads,
+    scan_zmw_to_chrom,
+    stream_ccs_reads,
     process_subread_alignment,
     calculate_all_base_compositions,
 )
 
 chrM_length = 16569
+ccs_bam = "ccs.bam"
+zmw_list = [12345, 67890]
 
 # Load circularized reference (chrM sequence concatenated with itself)
 ref_seqs = load_reference("reference.fasta")
 
-# Load CCS reads and subreads for a set of ZMWs
-zmw_list = [12345, 67890]
-ccs_reads = load_ccs_reads("ccs.bam", zmw_list, chrM_length)
-subreads_by_zmw = load_subreads("subreads.bam", zmw_list)
+# Light pass over the CCS BAM: returns {zmw: reference_name}, needed before alignment
+zmw_to_chrom = scan_zmw_to_chrom(ccs_bam, zmw_list)
 
-# Map each ZMW to its chromosome
-zmw_to_chrom = {ccs["zmw"]: ccs["reference_name"] for ccs in ccs_reads}
+# Subreads still load eagerly (smaller; grouped by ZMW for alignment)
+subreads_by_zmw = load_subreads("subreads.bam", zmw_list)
 
 # Assign subreads to strands via competitive alignment
 assigned = process_subread_alignment(
@@ -46,21 +47,25 @@ assigned = process_subread_alignment(
     chrM_length=chrM_length, min_identity=0.5,
 )
 
-# Compute per-position base composition (in-memory DataFrame)
+# Stream CCS reads from the BAM into composition; CIGAR is parsed lazily in the worker
 composition_df = calculate_all_base_compositions(
-    ccs_reads, assigned, ref_seqs, zmw_to_chrom, chrM_length=chrM_length,
+    stream_ccs_reads(ccs_bam, zmw_list, chrM_length),
+    assigned, ref_seqs, zmw_to_chrom, chrM_length=chrM_length,
 )
 ```
 
-For full-scale jobs the concatenated DataFrame can exceed available memory
-(the 15-column frame is dominated by repeated string values that bloat to
-hundreds of GB across ~10⁹ rows). Pass `output_path=` to stream each
-per-CCS result to a zstd-compressed Parquet file instead and get the path
-back:
+`stream_ccs_reads` returns a one-shot iterator; pass a fresh call per
+consumer if you need to process the reads more than once.
+
+For full-scale jobs the concatenated composition DataFrame can exceed available
+memory (the 15-column frame is dominated by repeated string values that bloat to
+hundreds of GB across ~10⁹ rows). Pass `output_path=` to stream each per-CCS
+result to a zstd-compressed Parquet file instead and get the path back:
 
 ```python
 out = calculate_all_base_compositions(
-    ccs_reads, assigned, ref_seqs, zmw_to_chrom,
+    stream_ccs_reads(ccs_bam, zmw_list, chrM_length),
+    assigned, ref_seqs, zmw_to_chrom,
     chrM_length=chrM_length,
     output_path="composition.parquet",
 )
@@ -78,7 +83,8 @@ process_subread_alignment(
     output_path="aligned.parquet",
 )
 calculate_all_base_compositions(
-    ccs_reads, "aligned.parquet", ref_seqs, zmw_to_chrom,
+    stream_ccs_reads(ccs_bam, zmw_list, chrM_length),
+    "aligned.parquet", ref_seqs, zmw_to_chrom,
     chrM_length=chrM_length,
     output_path="composition.parquet",
 )

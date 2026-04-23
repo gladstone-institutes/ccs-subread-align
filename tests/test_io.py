@@ -8,10 +8,11 @@ import numpy as np
 import pandas as pd
 
 from ccs_subread_align.io import (
-    load_ccs_reads,
     load_reference,
     load_subreads,
     read_parquet,
+    scan_zmw_to_chrom,
+    stream_ccs_reads,
     write_parquet,
 )
 
@@ -40,19 +41,40 @@ def ccs_zmws():
     return sorted(zmws)
 
 
-# --- load_ccs_reads ---
+# --- scan_zmw_to_chrom ---
 
 
 @pytest.mark.skipif(not CCS_BAM.exists(), reason="Test BAM not available")
-def test_load_ccs_reads_returns_list(ccs_zmws):
-    reads = load_ccs_reads(str(CCS_BAM), ccs_zmws, CHRM_LENGTH)
-    assert isinstance(reads, list)
+def test_scan_zmw_to_chrom_maps_every_requested_zmw(ccs_zmws):
+    mapping = scan_zmw_to_chrom(str(CCS_BAM), ccs_zmws)
+    assert isinstance(mapping, dict)
+    assert set(mapping.keys()) == set(ccs_zmws)
+    for zmw, chrom in mapping.items():
+        assert isinstance(zmw, int)
+        assert isinstance(chrom, str)
+        assert len(chrom) > 0
+
+
+@pytest.mark.skipif(not CCS_BAM.exists(), reason="Test BAM not available")
+def test_scan_zmw_to_chrom_empty_zmw_list():
+    assert scan_zmw_to_chrom(str(CCS_BAM), []) == {}
+
+
+# --- stream_ccs_reads ---
+
+
+@pytest.mark.skipif(not CCS_BAM.exists(), reason="Test BAM not available")
+def test_stream_ccs_reads_yields_iterator(ccs_zmws):
+    stream = stream_ccs_reads(str(CCS_BAM), ccs_zmws, CHRM_LENGTH)
+    # Must be a one-shot iterator, not a list.
+    assert not isinstance(stream, list)
+    reads = list(stream)
     assert len(reads) > 0
 
 
 @pytest.mark.skipif(not CCS_BAM.exists(), reason="Test BAM not available")
-def test_load_ccs_reads_structure(ccs_zmws):
-    reads = load_ccs_reads(str(CCS_BAM), ccs_zmws, CHRM_LENGTH)
+def test_stream_ccs_reads_structure(ccs_zmws):
+    reads = list(stream_ccs_reads(str(CCS_BAM), ccs_zmws, CHRM_LENGTH))
     required_keys = {
         "zmw",
         "strand",
@@ -60,31 +82,42 @@ def test_load_ccs_reads_structure(ccs_zmws):
         "read_name",
         "query_sequence",
         "query_length",
-        "query_to_ref",
+        "cigartuples",
+        "reference_start",
+        "reference_name",
     }
     for read in reads:
         assert required_keys.issubset(read.keys())
+        # query_to_ref is deliberately absent — parsed lazily in composition.
+        assert "query_to_ref" not in read
         assert read["strand"] in ("fwd", "rev")
         assert read["query_length"] > 0
         assert len(read["query_sequence"]) == read["query_length"]
 
 
 @pytest.mark.skipif(not CCS_BAM.exists(), reason="Test BAM not available")
-def test_load_ccs_reads_empty_zmw_list():
-    reads = load_ccs_reads(str(CCS_BAM), [], CHRM_LENGTH)
-    assert reads == []
+def test_stream_ccs_reads_lazy_query_to_ref_matches_eager(ccs_zmws):
+    """Parsing cigartuples in the caller matches the pre-v0.6.0 eager path."""
+    from ccs_subread_align.alignment import parse_cigar_to_reference_map
+
+    for read in stream_ccs_reads(str(CCS_BAM), ccs_zmws, CHRM_LENGTH):
+        lazy = parse_cigar_to_reference_map(
+            read["cigartuples"],
+            read["reference_start"],
+            read["query_length"],
+            CHRM_LENGTH,
+        )
+        assert isinstance(lazy, np.ndarray)
+        assert lazy.dtype == np.int32
+        assert lazy.shape == (read["query_length"],)
+        valid = lazy[lazy >= 0]
+        assert (valid < CHRM_LENGTH).all()
 
 
 @pytest.mark.skipif(not CCS_BAM.exists(), reason="Test BAM not available")
-def test_load_ccs_reads_query_to_ref(ccs_zmws):
-    reads = load_ccs_reads(str(CCS_BAM), ccs_zmws, CHRM_LENGTH)
-    for read in reads:
-        arr = read["query_to_ref"]
-        assert isinstance(arr, np.ndarray)
-        assert arr.dtype == np.int32
-        assert arr.shape == (read["query_length"],)
-        valid = arr[arr >= 0]
-        assert (valid < CHRM_LENGTH).all()
+def test_stream_ccs_reads_empty_zmw_list():
+    reads = list(stream_ccs_reads(str(CCS_BAM), [], CHRM_LENGTH))
+    assert reads == []
 
 
 # --- load_subreads ---
@@ -132,17 +165,6 @@ def test_load_reference_has_sequences():
     for name, seq in ref_seqs.items():
         assert isinstance(name, str)
         assert len(seq) > 0
-
-
-# --- CCS reads include reference_name ---
-
-
-@pytest.mark.skipif(not CCS_BAM.exists(), reason="Test BAM not available")
-def test_load_ccs_reads_has_reference_name(ccs_zmws):
-    reads = load_ccs_reads(str(CCS_BAM), ccs_zmws, CHRM_LENGTH)
-    for read in reads:
-        assert "reference_name" in read
-        assert isinstance(read["reference_name"], str)
 
 
 # --- Parquet read/write ---

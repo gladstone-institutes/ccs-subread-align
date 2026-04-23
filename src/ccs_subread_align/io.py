@@ -5,14 +5,14 @@ import resource
 import sys
 import time
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, Iterator, List
 
 import numpy as np
 import pandas as pd
 import pysam
 from tqdm import tqdm
 
-from ccs_subread_align.alignment import extract_zmw_from_name, parse_cigar_to_reference_map
+from ccs_subread_align.alignment import extract_zmw_from_name
 
 logger = logging.getLogger(__name__)
 
@@ -42,81 +42,83 @@ def load_reference(fasta_path: str) -> Dict[str, str]:
     return ref_seqs
 
 
-def load_ccs_reads(
+def scan_zmw_to_chrom(
+    ccs_bam_path: str, zmw_list: List[int]
+) -> Dict[int, str]:
+    """Light BAM scan that returns the ``{zmw: reference_name}`` mapping.
+
+    Alignment needs this before composition runs, so it's broken out of the
+    full CCS streamer. Reads only the fields needed for the mapping, leaving
+    sequences, qualities, and CIGAR unparsed.
+    """
+    logger.info(f"Scanning zmw→chrom from: {ccs_bam_path}")
+    zmw_set = set(zmw_list)
+    mapping: Dict[int, str] = {}
+    t0 = time.monotonic()
+    with pysam.AlignmentFile(ccs_bam_path, "rb") as bam:
+        for read in tqdm(bam.fetch(), desc="Scan zmw→chrom", unit="reads"):
+            zmw = extract_zmw_from_name(read.query_name)
+            if zmw in zmw_set and zmw not in mapping:
+                mapping[zmw] = read.reference_name
+    logger.info(
+        f"Scan complete: {len(mapping)} zmws mapped in "
+        f"{time.monotonic() - t0:.1f}s"
+    )
+    return mapping
+
+
+def stream_ccs_reads(
     ccs_bam_path: str,
     zmw_list: List[int],
     chrM_length: int,
-) -> List[Dict]:
+) -> Iterator[Dict]:
+    """Yield CCS read dicts from BAM one-at-a-time.
+
+    Replaces the pre-v0.6.0 ``load_ccs_reads`` list return. `query_to_ref`
+    is NOT precomputed — each yielded dict carries ``cigartuples``,
+    ``reference_start``, and ``query_length`` so the composition worker
+    parses the CIGAR lazily (see ``composition.calculate_base_composition``).
+    This is what keeps the parent process out of the ~21 GB regime at full
+    scale (240k × ~68 kB query_to_ref arrays).
+
+    ``chrM_length`` is carried in each yielded dict so downstream workers
+    have it without a closure over this function's scope.
     """
-    Load CCS reads from BAM file.
-
-    Runs in two phases: (1) iterate the BAM and collect per-read fields,
-    (2) build a per-read int32 ``query_to_ref`` array from the CIGAR.
-
-    Args:
-        ccs_bam_path: Path to CCS BAM file
-        zmw_list: List of ZMWs to load
-        chrM_length: Mitochondrial genome length for position normalization
-
-    Returns:
-        List of CCS read dictionaries
-    """
-    logger.info(f"Loading CCS reads from: {ccs_bam_path}")
+    logger.info(f"Streaming CCS reads from: {ccs_bam_path}")
     zmw_set = set(zmw_list)
     target_n = len(zmw_set)
-    ccs_reads = []
-
-    logger.info(f"Phase 1: iterating BAM for {target_n} target ZMWs")
     t0 = time.monotonic()
+    yielded = 0
     with pysam.AlignmentFile(ccs_bam_path, "rb") as bam:
-        for read in tqdm(bam.fetch(), desc="Phase 1: scanning BAM", unit="reads"):
+        for read in tqdm(bam.fetch(), desc="Streaming CCS reads", unit="reads"):
             zmw = extract_zmw_from_name(read.query_name)
-            if zmw in zmw_set:
-                strand = "rev" if read.is_reverse else "fwd"
-
-                ccs_reads.append(
-                    {
-                        "zmw": zmw,
-                        "strand": strand,
-                        "zmw_strand": f"{zmw}_{strand}",
-                        "read_name": read.query_name,
-                        "sam_flag": read.flag,
-                        "reference_start": read.reference_start,
-                        "query_sequence": read.query_sequence,
-                        "query_length": read.query_length,
-                        "cigartuples": read.cigartuples,
-                        "quality_array": (
-                            np.array(read.query_qualities)
-                            if read.query_qualities
-                            else np.zeros(read.query_length)
-                        ),
-                        "mapping_quality": read.mapping_quality,
-                        "reference_name": read.reference_name,
-                    }
-                )
-
-    k = len(ccs_reads)
+            if zmw not in zmw_set:
+                continue
+            strand = "rev" if read.is_reverse else "fwd"
+            yield {
+                "zmw": zmw,
+                "strand": strand,
+                "zmw_strand": f"{zmw}_{strand}",
+                "read_name": read.query_name,
+                "sam_flag": read.flag,
+                "reference_start": read.reference_start,
+                "query_sequence": read.query_sequence,
+                "query_length": read.query_length,
+                "cigartuples": read.cigartuples,
+                "quality_array": (
+                    np.array(read.query_qualities)
+                    if read.query_qualities
+                    else np.zeros(read.query_length)
+                ),
+                "mapping_quality": read.mapping_quality,
+                "reference_name": read.reference_name,
+                "chrM_length": chrM_length,
+            }
+            yielded += 1
     logger.info(
-        f"Phase 1 complete: read {k}/{target_n} CCS records in "
+        f"Streamed {yielded}/{target_n} CCS records in "
         f"{time.monotonic() - t0:.1f}s (peak RSS: {_peak_rss_mb():.0f} MB)"
     )
-
-    logger.info(f"Phase 2: building query→reference maps for {k} CCS reads")
-    t1 = time.monotonic()
-    for ccs in tqdm(ccs_reads, desc="Phase 2: CIGAR parse"):
-        ccs["query_to_ref"] = parse_cigar_to_reference_map(
-            ccs["cigartuples"],
-            ccs["reference_start"],
-            ccs["query_length"],
-            chrM_length,
-        )
-
-    logger.info(
-        f"Phase 2 complete in {time.monotonic() - t1:.1f}s "
-        f"(peak RSS: {_peak_rss_mb():.0f} MB)"
-    )
-    logger.info(f"Loaded {k} CCS reads")
-    return ccs_reads
 
 
 def load_subreads(

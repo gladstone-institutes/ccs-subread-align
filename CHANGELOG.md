@@ -2,9 +2,29 @@
 
 <!--next-version-placeholder-->
 
+## v0.6.0 (23/04/2026)
+
+- **BREAKING**: `io.load_ccs_reads` is removed. Replaced by two functions with different scopes: `io.scan_zmw_to_chrom(bam, zmw_list)` (light pass that returns only the `{zmw: reference_name}` mapping, for use before alignment) and `io.stream_ccs_reads(bam, zmw_list, chrM_length)` (generator that yields CCS dicts one-at-a-time from the BAM, for use by composition). `query_to_ref` is no longer precomputed at load time; `composition.calculate_base_composition` parses `cigartuples` on demand in the worker (falling back to a precomputed `query_to_ref` when present so existing tests keep working). Removes the parent-side floor of ~21 GB at the 240k-CCS scale (~17 GB of `query_to_ref` arrays + ~4 GB of sequences) that used to sit resident from load through composition completion.
+- `composition.calculate_all_base_compositions` accepts `Iterable[Dict]` for `ccs_reads` and iterates it exactly once. The pre-count pass for tqdm's total is removed; the progress bar now shows items-processed and rate. Callers that want a percent-complete can wrap their own tqdm.
+- `alignment.process_subread_alignment` no longer builds a full `all_subreads` list before dispatching to the pool. The parent feeds a generator directly to `pool.imap`, and `ref_seqs` is shipped to workers once via a pool `initializer` (module-global `_WORKER_REF_SEQS`) instead of being embedded in every work item. Cuts a ~2 GB parent-side list at full scale and eliminates redundant `ref_seqs` re-pickling per imap chunk.
+- `_pool.get_pool` grows `initializer=` and `initargs=` passthrough arguments.
+
+### Migration
+
+```diff
+-ccs_reads = io.load_ccs_reads(ccs_bam, zmw_list, chrM_length)
+-zmw_to_chrom = {c["zmw"]: c["reference_name"] for c in ccs_reads}
++zmw_to_chrom = io.scan_zmw_to_chrom(ccs_bam, zmw_list)
+ alignment.process_subread_alignment(zmw_list, subreads, ref_seqs, zmw_to_chrom, chrM_length, min_identity, output_path=aligned_pq)
+-composition.calculate_all_base_compositions(ccs_reads, aligned_pq, ref_seqs, zmw_to_chrom, chrM_length, output_path=comp_pq)
++composition.calculate_all_base_compositions(io.stream_ccs_reads(ccs_bam, zmw_list, chrM_length), aligned_pq, ref_seqs, zmw_to_chrom, chrM_length, output_path=comp_pq)
+```
+
+Memory on the in-repo test BAM (dozens of CCSs, all-in-memory dominates): peak RSS was 274 MB pre-v0.6.0 and 272 MB post-v0.6.0, so the delta barely registers at this scale. The design target is the 240k-CCS production scale, where the ~21 GB parent-side floor disappears.
+
 ## v0.5.1 (23/04/2026)
 
-- Fix `pyarrow.lib.ArrowInvalid: offset overflow` in `_group_subreads_from_parquet` at full scale. The assigned-subread parquet stored `aligned_sequence` as `pa.string()` (int32 offsets); `pq.read_table` preserved per-row-group chunks under 2 GB, but `table.take()` physically combined them and tipped past the 2 GB offset cap. Reader now casts string columns to `large_string` before `take()`, and the write schema for `aligned_sequence` is widened to `pa.large_string()` so a 100k-row flush buffer of long reads also cannot overflow during `pa.array` construction. `subread_name` stays as `pa.string()` (read names ~50 B, never overflows).
+- Fix `pyarrow.lib.ArrowInvalid: offset overflow` in `_group_subreads_from_parquet` at full scale. The assigned-subread parquet stored `aligned_sequence` as `pa.string()` (int32 offsets); `pq.read_table` preserved per-row-group chunks under 2 GB, but the grouper's per-group `table.take()` fan-out combined them into one contiguous buffer and tipped past the 2 GB offset cap, *and* held peak memory at ~2× the parquet (one fresh buffer per group). Reader now casts string columns to `large_string`, sorts once by `(zmw, strand)`, then emits zero-copy `table.slice()` views per contiguous run. Peak RSS on a 2.4 GB stress reproducer dropped from 7.5 GB (take fan-out) to 4.5 GB (sort transient). The write schema for `aligned_sequence` is also widened to `pa.large_string()` so a 100k-row flush buffer of long reads cannot overflow during `pa.array` construction. `subread_name` stays as `pa.string()` (read names ~50 B, never overflows).
 
 ## v0.5.0 (22/04/2026)
 

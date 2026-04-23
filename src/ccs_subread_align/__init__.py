@@ -15,10 +15,11 @@ from ccs_subread_align.composition import (
     calculate_base_composition,
 )
 from ccs_subread_align.io import (
-    load_ccs_reads,
     load_reference,
     load_subreads,
     read_parquet,
+    scan_zmw_to_chrom,
+    stream_ccs_reads,
     write_parquet,
 )
 
@@ -31,7 +32,8 @@ __all__ = [
     "process_subread_alignment",
     "calculate_base_composition",
     "calculate_all_base_compositions",
-    "load_ccs_reads",
+    "scan_zmw_to_chrom",
+    "stream_ccs_reads",
     "load_reference",
     "load_subreads",
     "read_parquet",

@@ -376,10 +376,12 @@ def test_assign_strand_position_map_valid(ref_seq):
 # --- _assign_single_subread ---
 
 
-def test_assign_single_subread_short():
+def test_assign_single_subread_short(ref_seq):
     """Subreads shorter than 25bp should be skipped."""
+    from ccs_subread_align.alignment import _worker_init
+    _worker_init({"chrM": ref_seq})
     result = _assign_single_subread(
-        {"zmw": 1, "read_name": "test", "query_sequence": "ATCG", "_ref_seq": "ATCG" * 100},
+        {"zmw": 1, "read_name": "test", "query_sequence": "ATCG", "chrom": "chrM"},
         chrM_length=100,
         min_identity=0.5,
     )
@@ -388,11 +390,13 @@ def test_assign_single_subread_short():
 
 def test_assign_single_subread_valid(ref_seq):
     """Valid subread should return full result dict."""
+    from ccs_subread_align.alignment import _worker_init
+    _worker_init({"chrM": ref_seq})
     subread_dict = {
         "zmw": 42,
         "read_name": "movie/42/0_100",
         "query_sequence": ref_seq[200:300],
-        "_ref_seq": ref_seq,
+        "chrom": "chrM",
     }
     result = _assign_single_subread(
         subread_dict,
@@ -446,7 +450,11 @@ def test_assign_real_subreads(ref_seq):
 
 
 def _load_full_bam_inputs():
-    from ccs_subread_align.io import load_ccs_reads, load_reference, load_subreads
+    from ccs_subread_align.io import (
+        load_reference,
+        load_subreads,
+        scan_zmw_to_chrom,
+    )
 
     ref_seqs = load_reference(str(REF_FASTA))
 
@@ -461,10 +469,12 @@ def _load_full_bam_inputs():
                     pass
     zmw_list = sorted(zmws)
 
-    ccs_reads = load_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH)
+    zmw_to_chrom = scan_zmw_to_chrom(str(CCS_BAM), zmw_list)
     subreads_by_zmw = load_subreads(str(SUBREADS_BAM), zmw_list)
-    zmw_to_chrom = {ccs["zmw"]: ccs["reference_name"] for ccs in ccs_reads}
-    return ref_seqs, zmw_list, ccs_reads, subreads_by_zmw, zmw_to_chrom
+    # Test helper returns `None` for the legacy ccs_reads slot so callers
+    # that used to unpack it as a list now get a clear failure if they
+    # reference it. Composition-side tests build their own stream.
+    return ref_seqs, zmw_list, None, subreads_by_zmw, zmw_to_chrom
 
 
 @pytest.mark.skipif(

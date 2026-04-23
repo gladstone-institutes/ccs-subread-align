@@ -7,9 +7,20 @@ Windows, where ``forkserver`` is not available.
 
 import multiprocessing as mp
 import sys
+from typing import Callable, Optional, Tuple
 
 
-def get_pool(n_cores: int, maxtasksperchild: int = 200):
+def get_pool(
+    n_cores: int,
+    maxtasksperchild: int = 200,
+    initializer: Optional[Callable] = None,
+    initargs: Tuple = (),
+):
     method = "spawn" if sys.platform == "win32" else "forkserver"
     ctx = mp.get_context(method)
-    return ctx.Pool(processes=n_cores, maxtasksperchild=maxtasksperchild)
+    return ctx.Pool(
+        processes=n_cores,
+        maxtasksperchild=maxtasksperchild,
+        initializer=initializer,
+        initargs=initargs,
+    )

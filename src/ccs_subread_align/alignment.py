@@ -17,6 +17,18 @@ from ccs_subread_align._pool import get_pool
 
 logger = logging.getLogger(__name__)
 
+# Populated in each worker via `_worker_init` when a pool is used. Keeping
+# `ref_seqs` out of the per-task payload saves ~33 kB/chunk of pickle
+# bandwidth and (more importantly) removes the pointer to a big dict from
+# every work item, keeping the generator-fed imap lightweight.
+_WORKER_REF_SEQS: Optional[Dict[str, str]] = None
+
+
+def _worker_init(ref_seqs: Dict[str, str]) -> None:
+    global _WORKER_REF_SEQS
+    _WORKER_REF_SEQS = ref_seqs
+
+
 # Row buffer flush threshold for streaming assigned-subread parquet output.
 # Alignment rows carry variable-length aligned_sequence + position_map,
 # so use a smaller buffer than the composition-side 1M-row value.
@@ -228,20 +240,19 @@ def _assign_single_subread(
     """
     Worker function for parallel subread assignment.
 
-    Args:
-        subread_dict: Dictionary with 'zmw', 'read_name', 'query_sequence', '_ref_seq'
-        chrM_length: Mitochondrial genome length
-        min_identity: Minimum alignment identity
-
-    Returns:
-        dict or None: Assignment result with zmw info, or None if failed
+    Reads the reference sequence for this subread's chrom from the
+    process-wide ``_WORKER_REF_SEQS`` dict populated by ``_worker_init``.
+    For the single-core in-process fallback we set ``_WORKER_REF_SEQS``
+    from the main process before dispatch (see ``process_subread_alignment``).
     """
     if len(subread_dict["query_sequence"]) < 25:
         return None
 
+    ref_seq = _WORKER_REF_SEQS[subread_dict["chrom"]]
+
     assignment = assign_subreads_to_strand(
         subread_dict["query_sequence"],
-        subread_dict["_ref_seq"],
+        ref_seq,
         chrM_length,
         min_identity,
         report_margin=report_margin,
@@ -264,19 +275,28 @@ def _assign_single_subread(
 
 
 def _iter_worker_results(
-    all_subreads: List[Dict],
+    subreads_iter: Iterable[Dict],
     worker,
     n_cores: int,
-    total: int,
+    ref_seqs: Dict[str, str],
+    total: Optional[int],
 ) -> Iterable[Optional[Dict]]:
-    """Yield worker outputs one-at-a-time; never materializes the full list."""
+    """Yield worker outputs one-at-a-time from a generator of subread dicts.
+
+    The pool is created with an initializer that seeds each worker's
+    module-global ``_WORKER_REF_SEQS`` once, so per-task payloads carry
+    only the zmw's ``chrom`` string instead of a full ref_seq reference.
+    """
     if n_cores == 1:
-        for sr in tqdm(all_subreads, total=total, desc="Assigning subreads"):
+        # Single-core fallback runs inline; seed the module-global so
+        # _assign_single_subread's ref_seq lookup works without a pool.
+        _worker_init(ref_seqs)
+        for sr in tqdm(subreads_iter, total=total, desc="Assigning subreads"):
             yield worker(sr)
     else:
-        with get_pool(n_cores) as pool:
+        with get_pool(n_cores, initializer=_worker_init, initargs=(ref_seqs,)) as pool:
             yield from tqdm(
-                pool.imap(worker, all_subreads, chunksize=50),
+                pool.imap(worker, subreads_iter, chunksize=50),
                 total=total,
                 desc=f"Assigning subreads ({n_cores} cores)",
             )
@@ -343,28 +363,39 @@ def process_subread_alignment(
     if n_cores is None:
         n_cores = cpu_count()
 
-    all_subreads = []
-    skipped_zmws = {}
-    for zmw in zmw_list:
-        chrom = zmw_to_chrom.get(zmw)
-        if chrom is None or chrom not in ref_seqs:
-            skipped_zmws[zmw] = chrom
-            continue
-        ref_seq = ref_seqs[chrom]
-        for sr in subreads_by_zmw.get(zmw, []):
-            sr_copy = sr.copy()
-            sr_copy["zmw"] = zmw
-            sr_copy["_ref_seq"] = ref_seq
-            all_subreads.append(sr_copy)
-
+    skipped_zmws = {
+        zmw: zmw_to_chrom.get(zmw)
+        for zmw in zmw_list
+        if zmw_to_chrom.get(zmw) is None or zmw_to_chrom.get(zmw) not in ref_seqs
+    }
     if skipped_zmws:
         logger.warning(
             f"Skipping {len(skipped_zmws)} ZMWs mapped to chromosomes not in reference: "
             f"{skipped_zmws}"
         )
 
-    total = len(all_subreads)
+    # O(len(zmw_list)) pre-count; cheap compared to building the full list
+    # and keeps tqdm's total accurate.
+    total = sum(
+        len(subreads_by_zmw.get(zmw, []))
+        for zmw in zmw_list
+        if zmw not in skipped_zmws
+    )
     logger.info(f"Assigning {total} subreads using {n_cores} cores")
+
+    def _iter_subreads_for_pool() -> Iterable[Dict]:
+        # Attach zmw + chrom to each subread just-in-time. Keeping this a
+        # generator means the parent never holds all ~1.68M-at-full-scale
+        # subread dicts simultaneously; imap pulls one at a time.
+        for zmw in zmw_list:
+            if zmw in skipped_zmws:
+                continue
+            chrom = zmw_to_chrom[zmw]
+            for sr in subreads_by_zmw.get(zmw, []):
+                sr_copy = sr.copy()
+                sr_copy["zmw"] = zmw
+                sr_copy["chrom"] = chrom
+                yield sr_copy
 
     worker = partial(
         _assign_single_subread,
@@ -373,7 +404,9 @@ def process_subread_alignment(
         report_margin=report_margin,
     )
 
-    result_iter = _iter_worker_results(all_subreads, worker, n_cores, total)
+    result_iter = _iter_worker_results(
+        _iter_subreads_for_pool(), worker, n_cores, ref_seqs, total
+    )
 
     if output_path is not None:
         output_path = Path(output_path)

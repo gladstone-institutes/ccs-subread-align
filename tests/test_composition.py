@@ -134,7 +134,12 @@ def test_base_composition_insertion_positions():
 )
 def test_calculate_all_base_compositions_integration():
     from ccs_subread_align.alignment import process_subread_alignment
-    from ccs_subread_align.io import load_ccs_reads, load_reference, load_subreads
+    from ccs_subread_align.io import (
+        load_reference,
+        load_subreads,
+        scan_zmw_to_chrom,
+        stream_ccs_reads,
+    )
 
     ref_seqs = load_reference(str(REF_FASTA))
 
@@ -151,9 +156,8 @@ def test_calculate_all_base_compositions_integration():
                     pass
     zmw_list = sorted(zmws)
 
-    ccs_reads = load_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH)
+    zmw_to_chrom = scan_zmw_to_chrom(str(CCS_BAM), zmw_list)
     subreads_by_zmw = load_subreads(str(SUBREADS_BAM), zmw_list)
-    zmw_to_chrom = {ccs["zmw"]: ccs["reference_name"] for ccs in ccs_reads}
 
     assigned = process_subread_alignment(
         zmw_list,
@@ -166,7 +170,12 @@ def test_calculate_all_base_compositions_integration():
     )
 
     df = calculate_all_base_compositions(
-        ccs_reads, assigned, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=4
+        stream_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH),
+        assigned,
+        ref_seqs,
+        zmw_to_chrom,
+        CHRM_LENGTH,
+        n_cores=4,
     )
 
     assert isinstance(df, pd.DataFrame)
@@ -188,7 +197,12 @@ def test_calculate_all_base_compositions_integration():
 def test_calculate_all_base_compositions_streaming(tmp_path):
     """Streaming output mode must produce identical rows to the in-memory path."""
     from ccs_subread_align.alignment import process_subread_alignment
-    from ccs_subread_align.io import load_ccs_reads, load_reference, load_subreads
+    from ccs_subread_align.io import (
+        load_reference,
+        load_subreads,
+        scan_zmw_to_chrom,
+        stream_ccs_reads,
+    )
 
     ref_seqs = load_reference(str(REF_FASTA))
 
@@ -205,9 +219,8 @@ def test_calculate_all_base_compositions_streaming(tmp_path):
                     pass
     zmw_list = sorted(zmws)
 
-    ccs_reads = load_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH)
+    zmw_to_chrom = scan_zmw_to_chrom(str(CCS_BAM), zmw_list)
     subreads_by_zmw = load_subreads(str(SUBREADS_BAM), zmw_list)
-    zmw_to_chrom = {ccs["zmw"]: ccs["reference_name"] for ccs in ccs_reads}
 
     assigned = process_subread_alignment(
         zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
@@ -215,12 +228,14 @@ def test_calculate_all_base_compositions_streaming(tmp_path):
     )
 
     df_mem = calculate_all_base_compositions(
-        ccs_reads, assigned, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
+        stream_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH),
+        assigned, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
     )
 
     out_path = tmp_path / "composition.parquet"
     returned = calculate_all_base_compositions(
-        ccs_reads, assigned, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
+        stream_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH),
+        assigned, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
         output_path=out_path,
     )
 
@@ -265,6 +280,56 @@ def test_streaming_empty_result(tmp_path):
     assert not out_path.exists()
 
 
+def test_calculate_all_base_compositions_accepts_generator(tmp_path):
+    """The CCS argument may be a one-shot generator; the function must not
+    try to re-iterate it (no pre-count pass)."""
+    ccs1 = _make_ccs_read("ACGTACGT", zmw=1, strand="fwd")
+    ccs2 = _make_ccs_read("TTTTAAAA", zmw=2, strand="rev")
+    sr1 = _make_subread("ACGTACGT", [0, 1, 2, 3, 4, 5, 6, 7], zmw=1, strand="fwd")
+    sr2 = _make_subread("TTTTAAAA", [0, 1, 2, 3, 4, 5, 6, 7], zmw=2, strand="rev")
+    ref_seq = "ACGT" * 5000
+
+    def _one_shot():
+        yield ccs1
+        yield ccs2
+
+    out_path = tmp_path / "gen.parquet"
+    returned = calculate_all_base_compositions(
+        ccs_reads=_one_shot(),
+        assigned_subreads=[sr1, sr2],
+        ref_seqs={"chrM": ref_seq},
+        zmw_to_chrom={1: "chrM", 2: "chrM"},
+        chrM_length=CHRM_LENGTH,
+        n_cores=1,
+        output_path=out_path,
+    )
+    assert returned == out_path
+    df = pd.read_parquet(out_path)
+    assert len(df) == 16  # 2 reads × 8 positions
+
+
+def test_calculate_base_composition_parses_cigar_lazily():
+    """When query_to_ref is absent, the worker parses cigartuples on the fly."""
+    # Build a CCS dict without query_to_ref, with identity CIGAR (8 matches).
+    ccs = {
+        "zmw": 1,
+        "strand": "fwd",
+        "zmw_strand": "1_fwd",
+        "query_sequence": "ACGTACGT",
+        "query_length": 8,
+        "quality_array": np.array([30] * 8, dtype=np.uint8),
+        "cigartuples": [(7, 8)],  # op 7 == SEQ_MATCH (=)
+        "reference_start": 0,
+    }
+    sr = _make_subread("ACGTACGT", [0, 1, 2, 3, 4, 5, 6, 7])
+    ref_seq = "ACGT" * 5000
+    df = calculate_base_composition(ccs, [sr], ref_seq, CHRM_LENGTH)
+    assert len(df) == 8
+    assert (df["total_subreads"] == 1).all()
+    assert (df["agreement_fraction"] == 1.0).all()
+    assert df["ref_pos"].tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
 def test_streaming_small_synthetic(tmp_path):
     """Streaming path works with n_cores=1 and a handful of reads."""
     ccs1 = _make_ccs_read("ACGTACGT", zmw=1, strand="fwd")
@@ -296,7 +361,12 @@ def test_streaming_small_synthetic(tmp_path):
 def test_calculate_all_base_compositions_from_parquet(tmp_path):
     """Piping streamed alignment parquet into composition must equal the in-memory path."""
     from ccs_subread_align.alignment import process_subread_alignment
-    from ccs_subread_align.io import load_ccs_reads, load_reference, load_subreads
+    from ccs_subread_align.io import (
+        load_reference,
+        load_subreads,
+        scan_zmw_to_chrom,
+        stream_ccs_reads,
+    )
 
     ref_seqs = load_reference(str(REF_FASTA))
 
@@ -313,9 +383,8 @@ def test_calculate_all_base_compositions_from_parquet(tmp_path):
                     pass
     zmw_list = sorted(zmws)
 
-    ccs_reads = load_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH)
+    zmw_to_chrom = scan_zmw_to_chrom(str(CCS_BAM), zmw_list)
     subreads_by_zmw = load_subreads(str(SUBREADS_BAM), zmw_list)
-    zmw_to_chrom = {ccs["zmw"]: ccs["reference_name"] for ccs in ccs_reads}
 
     # Legacy path: in-memory List[Dict].
     assigned_list = process_subread_alignment(
@@ -323,7 +392,8 @@ def test_calculate_all_base_compositions_from_parquet(tmp_path):
         min_identity=0.5, n_cores=2,
     )
     df_from_list = calculate_all_base_compositions(
-        ccs_reads, assigned_list, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
+        stream_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH),
+        assigned_list, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
     )
 
     # Streaming path: parquet round-trip.
@@ -333,7 +403,8 @@ def test_calculate_all_base_compositions_from_parquet(tmp_path):
         min_identity=0.5, n_cores=2, output_path=aligned_parquet,
     )
     df_from_parquet = calculate_all_base_compositions(
-        ccs_reads, aligned_parquet, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
+        stream_ccs_reads(str(CCS_BAM), zmw_list, CHRM_LENGTH),
+        aligned_parquet, ref_seqs, zmw_to_chrom, CHRM_LENGTH, n_cores=2,
     )
 
     assert len(df_from_parquet) == len(df_from_list)

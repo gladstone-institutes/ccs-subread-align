@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from ccs_subread_align._pool import get_pool
+from ccs_subread_align.alignment import parse_cigar_to_reference_map
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +42,12 @@ def calculate_base_composition(
     the CCS base call.
 
     Args:
-        ccs_read: CCS read dictionary (from load_ccs_reads) with keys including
-            query_sequence, query_length, query_to_ref, quality_array, zmw,
-            strand, zmw_strand.
+        ccs_read: CCS read dictionary (from `io.stream_ccs_reads`) with keys
+            including query_sequence, query_length, quality_array, zmw,
+            strand, zmw_strand. If ``query_to_ref`` is absent, it is
+            computed on the fly from ``cigartuples``, ``reference_start``
+            and ``query_length`` so the parent process never holds the
+            parsed arrays (~68 kB per CCS at full scale).
         assigned_subreads: List of assigned subread dicts (from process_subread_alignment)
             for this CCS read's (zmw, strand). Each must have aligned_sequence and
             position_map.
@@ -56,7 +60,14 @@ def calculate_base_composition(
         C_count, G_count, N_count, total_subreads, agreement_fraction.
     """
     ccs_len = ccs_read["query_length"]
-    ccs_to_ref = ccs_read["query_to_ref"]
+    ccs_to_ref = ccs_read.get("query_to_ref")
+    if ccs_to_ref is None:
+        ccs_to_ref = parse_cigar_to_reference_map(
+            ccs_read["cigartuples"],
+            ccs_read["reference_start"],
+            ccs_len,
+            chrM_length,
+        )
     ccs_seq = ccs_read["query_sequence"]
 
     base_counts = np.zeros((ccs_len, 5), dtype=np.int32)
@@ -163,16 +174,19 @@ def _group_subreads_from_parquet(
 ) -> Dict[Tuple[int, str], pa.Table]:
     """Load a streamed-alignment parquet and group rows by (zmw, strand).
 
-    Rows are sliced from the single in-memory pyarrow Table; each group value
-    is a lightweight zero-copy view, not a new buffer. Using pyarrow here
-    keeps the per-row overhead ~5-10x smaller than rebuilding a ``List[Dict]``
-    of Python objects.
+    Rows are sorted once by (zmw, strand), then each group is a zero-copy
+    ``table.slice(...)`` view into the sorted table. Peak memory stays at
+    ~1x the parquet (transiently 2x during ``sort_by`` itself, which is
+    reassigned immediately so the unsorted copy can be freed), versus 2x
+    if we fanned out with per-group ``take()`` which allocates a fresh
+    buffer for every group.
     """
     table = pq.read_table(str(path))
-    # `take` combines column chunks into a single chunk, which overflows
-    # int32 offsets on `string` columns once total bytes pass ~2GB (full-scale
-    # aligned_sequence easily hits this). Promote string columns to
-    # large_string so take() uses int64 offsets.
+    # `sort_by` internally calls `take(sort_indices)`, which combines column
+    # chunks into a single chunk and overflows int32 offsets on `string`
+    # columns once total bytes pass ~2 GB. Promote string columns to
+    # `large_string` (int64 offsets) first. No-op on fresh files; repairs
+    # legacy parquet written before the schema widening.
     new_schema = pa.schema(
         [
             f.with_type(pa.large_string()) if pa.types.is_string(f.type) else f
@@ -181,14 +195,28 @@ def _group_subreads_from_parquet(
     )
     if new_schema != table.schema:
         table = table.cast(new_schema)
+    # sort_by rejects dictionary-encoded columns, so decode `strand` to plain
+    # string first. Strand values are 3-byte strings with cardinality 2, so the
+    # decoded buffer is trivial relative to aligned_sequence.
+    strand_idx = table.schema.get_field_index("strand")
+    if pa.types.is_dictionary(table.schema.field(strand_idx).type):
+        table = table.set_column(
+            strand_idx, "strand", table.column("strand").cast(pa.string())
+        )
+    # Reassign so the unsorted copy is dropped as soon as sort_by returns.
+    table = table.sort_by([("zmw", "ascending"), ("strand", "ascending")])
     zmws = table.column("zmw").to_numpy(zero_copy_only=False)
     strands = table.column("strand").to_pylist()
-    groups: Dict[Tuple[int, str], List[int]] = defaultdict(list)
-    for i, (z, s) in enumerate(zip(zmws, strands)):
-        groups[(int(z), s)].append(i)
     result: Dict[Tuple[int, str], pa.Table] = {}
-    for key, idxs in groups.items():
-        result[key] = table.take(pa.array(idxs, type=pa.int64()))
+    n = len(zmws)
+    i = 0
+    while i < n:
+        z, s = int(zmws[i]), strands[i]
+        j = i + 1
+        while j < n and int(zmws[j]) == z and strands[j] == s:
+            j += 1
+        result[(z, s)] = table.slice(i, j - i)
+        i = j
     return result
 
 
@@ -221,7 +249,7 @@ def _pa_table_to_subread_dicts(table: pa.Table) -> List[Dict]:
 
 
 def calculate_all_base_compositions(
-    ccs_reads: List[Dict],
+    ccs_reads: Iterable[Dict],
     assigned_subreads: Union[List[Dict], str, Path],
     ref_seqs: Dict[str, str],
     zmw_to_chrom: Dict[int, str],
@@ -233,7 +261,10 @@ def calculate_all_base_compositions(
     Calculate base composition for all CCS reads.
 
     Args:
-        ccs_reads: List of CCS read dictionaries (from load_ccs_reads).
+        ccs_reads: Iterable of CCS read dicts. Typically the iterator
+            returned by ``io.stream_ccs_reads``; a ``List[Dict]`` is also
+            accepted. Iterated exactly once — the function does not
+            pre-count, so tqdm shows rate progress instead of a percent.
         assigned_subreads: Either a ``List[Dict]`` of assigned subread records
             (legacy in-memory path) or a path to a parquet file written by
             ``process_subread_alignment(..., output_path=...)``. The parquet
@@ -267,12 +298,6 @@ def calculate_all_base_compositions(
 
     logger.info(f"{len(subreads_by_zmw_strand)} unique (zmw, strand) groups")
 
-    # Pre-count eligible CCS reads so tqdm can show a real total without
-    # materializing the work_items list itself.
-    n_work_items = sum(
-        1 for ccs in ccs_reads if zmw_to_chrom.get(ccs["zmw"]) in ref_seqs
-    )
-
     def _iter_work_items() -> Iterator[Tuple]:
         for ccs in ccs_reads:
             chrom = zmw_to_chrom.get(ccs["zmw"])
@@ -288,14 +313,13 @@ def calculate_all_base_compositions(
                 matched = group
             yield (ccs, matched, ref_seqs[chrom], chrM_length)
 
-    logger.info(
-        f"Calculating base composition for {n_work_items} CCS reads using {n_cores} cores"
-    )
-
     desc = f"Processing CCS reads ({n_cores} cores)" if n_cores != 1 else "Processing CCS reads"
+    # total=None: ccs_reads is an iterable we only walk once, so tqdm shows
+    # rate + elapsed instead of a percent. Callers with an upfront count
+    # can wrap their own tqdm.
     df_iter = tqdm(
         _iter_worker_dfs(_iter_work_items(), n_cores),
-        total=n_work_items,
+        total=None,
         desc=desc,
     )
 
