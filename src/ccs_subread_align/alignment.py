@@ -22,12 +22,15 @@ logger = logging.getLogger(__name__)
 # so use a smaller buffer than the composition-side 1M-row value.
 _ASSIGNED_SUBREAD_FLUSH_ROWS = 100_000
 
+# `aligned_sequence` uses large_string (int64 offsets) because a 100k-row
+# flush batch can exceed 2GB of sequence bytes for longer PacBio reads, which
+# overflows int32 offsets in both pa.array construction and later take().
 _ASSIGNED_SUBREAD_SCHEMA = pa.schema(
     [
         pa.field("zmw", pa.int64()),
         pa.field("strand", pa.dictionary(pa.int8(), pa.string())),
         pa.field("subread_name", pa.string()),
-        pa.field("aligned_sequence", pa.string()),
+        pa.field("aligned_sequence", pa.large_string()),
         pa.field("position_map", pa.list_(pa.int32())),
         pa.field("identity", pa.float32()),
     ]
@@ -292,7 +295,7 @@ def _assigned_batch_to_table(batch: List[Dict], report_margin: bool) -> pa.Table
         "zmw": pa.array(zmws, type=pa.int64()),
         "strand": pa.array(strands, type=pa.string()).dictionary_encode(),
         "subread_name": pa.array(subread_names, type=pa.string()),
-        "aligned_sequence": pa.array(aligned, type=pa.string()),
+        "aligned_sequence": pa.array(aligned, type=pa.large_string()),
         "position_map": pa.array(pos_maps, type=pa.list_(pa.int32())),
         "identity": pa.array(identities, type=pa.float32()),
     }

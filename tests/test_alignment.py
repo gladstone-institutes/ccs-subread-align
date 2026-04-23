@@ -4,12 +4,14 @@ import os
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pysam
 import pytest
 
 from aligntools import Cigar, CigarActions
 
 from ccs_subread_align.alignment import (
+    _ASSIGNED_SUBREAD_SCHEMA,
     _assign_single_subread,
     assign_subreads_to_strand,
     extract_zmw_from_name,
@@ -17,6 +19,13 @@ from ccs_subread_align.alignment import (
     parse_edlib_cigar_to_positions,
     reverse_complement,
 )
+
+
+def test_assigned_subread_schema_uses_large_string():
+    # Regression guard: aligned_sequence must stay large_string so a 100k-row
+    # flush buffer of long reads can't overflow pyarrow int32 offsets at
+    # construction, and later cross-batch take() stays safe.
+    assert _ASSIGNED_SUBREAD_SCHEMA.field("aligned_sequence").type == pa.large_string()
 
 # aligntools is a dev-only dependency used here as a ground-truth reference
 # for the hand-rolled CIGAR walkers in alignment.py.

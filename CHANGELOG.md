@@ -2,6 +2,10 @@
 
 <!--next-version-placeholder-->
 
+## v0.5.1 (23/04/2026)
+
+- Fix `pyarrow.lib.ArrowInvalid: offset overflow` in `_group_subreads_from_parquet` at full scale. The assigned-subread parquet stored `aligned_sequence` as `pa.string()` (int32 offsets); `pq.read_table` preserved per-row-group chunks under 2 GB, but `table.take()` physically combined them and tipped past the 2 GB offset cap. Reader now casts string columns to `large_string` before `take()`, and the write schema for `aligned_sequence` is widened to `pa.large_string()` so a 100k-row flush buffer of long reads also cannot overflow during `pa.array` construction. `subread_name` stays as `pa.string()` (read names ~50 B, never overflows).
+
 ## v0.5.0 (22/04/2026)
 
 - `process_subread_alignment` gains an optional `output_path=` kwarg. When provided, assigned-subread records are streamed to a zstd-compressed Parquet file via `pyarrow.parquet.ParquetWriter` (100k-row flush buffer) and the function returns the path instead of a `List[Dict]`. Schema: `zmw:int64`, `strand:dict<string>`, `subread_name:string`, `aligned_sequence:string`, `position_map:list<int32>`, `identity:float32`, plus `edit_distance_margin:int32` when `report_margin=True`. Avoids materializing the tens-of-GB `results` list that drove the parent process over 30 GB before pool fork.

@@ -169,6 +169,18 @@ def _group_subreads_from_parquet(
     of Python objects.
     """
     table = pq.read_table(str(path))
+    # `take` combines column chunks into a single chunk, which overflows
+    # int32 offsets on `string` columns once total bytes pass ~2GB (full-scale
+    # aligned_sequence easily hits this). Promote string columns to
+    # large_string so take() uses int64 offsets.
+    new_schema = pa.schema(
+        [
+            f.with_type(pa.large_string()) if pa.types.is_string(f.type) else f
+            for f in table.schema
+        ]
+    )
+    if new_schema != table.schema:
+        table = table.cast(new_schema)
     zmws = table.column("zmw").to_numpy(zero_copy_only=False)
     strands = table.column("strand").to_pylist()
     groups: Dict[Tuple[int, str], List[int]] = defaultdict(list)

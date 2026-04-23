@@ -4,9 +4,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from ccs_subread_align.composition import (
+    _group_subreads_from_parquet,
     calculate_all_base_compositions,
     calculate_base_composition,
 )
@@ -349,3 +352,151 @@ def test_calculate_all_base_compositions_from_parquet(tmp_path):
         right["agreement_fraction"].to_numpy(),
         equal_nan=True,
     )
+
+
+# --- _group_subreads_from_parquet ---
+
+
+def _legacy_string_schema() -> pa.Schema:
+    # Mirrors the pre-v0.5.1 on-disk layout where aligned_sequence was
+    # pa.string(). We still want to read these files correctly.
+    return pa.schema(
+        [
+            pa.field("zmw", pa.int64()),
+            pa.field("strand", pa.dictionary(pa.int8(), pa.string())),
+            pa.field("subread_name", pa.string()),
+            pa.field("aligned_sequence", pa.string()),
+            pa.field("position_map", pa.list_(pa.int32())),
+            pa.field("identity", pa.float32()),
+        ]
+    )
+
+
+def _write_alignment_parquet(
+    path: Path,
+    rows: list,
+    schema: pa.Schema,
+    row_groups: int = 1,
+) -> None:
+    """Write a synthetic assigned-subread parquet split into `row_groups` chunks."""
+    chunk_size = (len(rows) + row_groups - 1) // row_groups
+    writer = pq.ParquetWriter(path, schema, compression="zstd")
+    try:
+        for start in range(0, len(rows), chunk_size):
+            batch = rows[start : start + chunk_size]
+            cols = {
+                "zmw": pa.array([r["zmw"] for r in batch], type=pa.int64()),
+                "strand": pa.array([r["strand"] for r in batch], type=pa.string()).dictionary_encode(),
+                "subread_name": pa.array([r["subread_name"] for r in batch], type=pa.string()),
+                "aligned_sequence": pa.array(
+                    [r["aligned_sequence"] for r in batch],
+                    type=schema.field("aligned_sequence").type,
+                ),
+                "position_map": pa.array(
+                    [r["position_map"] for r in batch], type=pa.list_(pa.int32())
+                ),
+                "identity": pa.array([r["identity"] for r in batch], type=pa.float32()),
+            }
+            writer.write_table(pa.Table.from_pydict(cols, schema=schema))
+    finally:
+        writer.close()
+
+
+def _make_row(
+    zmw: int,
+    strand: str,
+    seq: str,
+    idx: int = 0,
+    position_map: list = None,
+) -> dict:
+    return {
+        "zmw": zmw,
+        "strand": strand,
+        "subread_name": f"movie/{zmw}/{idx}_{idx + len(seq)}",
+        "aligned_sequence": seq,
+        # Default mirrors aligned_sequence length; pass `position_map=[...]`
+        # to override when you only need aligned_sequence to be large (the
+        # grouper under test never dereferences position_map).
+        "position_map": list(range(len(seq))) if position_map is None else position_map,
+        "identity": 0.95,
+    }
+
+
+def test_group_subreads_from_parquet_handles_legacy_string_schema(tmp_path):
+    """Legacy parquet files (aligned_sequence: pa.string) must still load.
+
+    Pins the read-side cast in _group_subreads_from_parquet: without it, a
+    future refactor could drop the cast and silently reintroduce the 2GB
+    take() overflow the moment a user has enough total sequence bytes.
+    """
+    rows = [
+        _make_row(1, "fwd", "ACGT"),
+        _make_row(1, "fwd", "ACGA"),
+        _make_row(2, "rev", "TTTT"),
+    ]
+    path = tmp_path / "legacy.parquet"
+    _write_alignment_parquet(path, rows, _legacy_string_schema())
+
+    on_disk = pq.read_table(path)
+    assert on_disk.schema.field("aligned_sequence").type == pa.string()
+
+    groups = _group_subreads_from_parquet(path)
+    assert set(groups.keys()) == {(1, "fwd"), (2, "rev")}
+    assert groups[(1, "fwd")].num_rows == 2
+    assert groups[(2, "rev")].num_rows == 1
+    for tbl in groups.values():
+        assert tbl.schema.field("aligned_sequence").type == pa.large_string()
+
+
+def test_group_subreads_from_parquet_groups_correctly(tmp_path):
+    """Sanity: grouper partitions rows by (zmw, strand) with no data loss."""
+    from ccs_subread_align.alignment import _ASSIGNED_SUBREAD_SCHEMA
+
+    rows = [
+        _make_row(1, "fwd", "AAAA", idx=0),
+        _make_row(1, "fwd", "AAAT", idx=1),
+        _make_row(1, "rev", "CCCC", idx=2),
+        _make_row(2, "fwd", "GGGG", idx=3),
+        _make_row(2, "rev", "TTTT", idx=4),
+        _make_row(3, "fwd", "ACGT", idx=5),
+    ]
+    path = tmp_path / "current.parquet"
+    _write_alignment_parquet(path, rows, _ASSIGNED_SUBREAD_SCHEMA, row_groups=2)
+
+    groups = _group_subreads_from_parquet(path)
+    assert set(groups.keys()) == {
+        (1, "fwd"), (1, "rev"), (2, "fwd"), (2, "rev"), (3, "fwd"),
+    }
+    assert groups[(1, "fwd")].num_rows == 2
+    assert groups[(1, "rev")].num_rows == 1
+    total = sum(tbl.num_rows for tbl in groups.values())
+    assert total == len(rows)
+
+
+def test_group_subreads_from_parquet_no_overflow_over_2gb(tmp_path):
+    """Reproduces the user's offset-overflow scenario end-to-end.
+
+    Writes a legacy-schema parquet with ~2.4 GB of aligned_sequence bytes
+    split across two <2GB row groups. Without the read-side cast, the
+    subsequent take() raises ArrowInvalid with the exact user-facing
+    message. With the cast, grouping succeeds and returns large_string
+    tables whose row counts match.
+
+    Heavy: allocates several GB of strings and runs ~30-60 s.
+    """
+    big_seq = "A" * 60_000_000  # 60 MB; zstd compresses the repeats to a tiny parquet
+    # Tiny position_map: the grouper never reads it, and a list(range(60M)) per
+    # row is ~1.7 GB of Python ints each (×40 rows ≈ 70 GB) that would dwarf
+    # the aligned_sequence bytes we actually want to stress.
+    rows = [
+        _make_row(1, "fwd", big_seq, idx=i, position_map=[0])
+        for i in range(40)
+    ]  # 40 * 60MB = 2.4GB of aligned_sequence bytes, the column we want to overflow
+
+    path = tmp_path / "overflow.parquet"
+    _write_alignment_parquet(path, rows, _legacy_string_schema(), row_groups=2)
+
+    groups = _group_subreads_from_parquet(path)
+    assert set(groups.keys()) == {(1, "fwd")}
+    assert groups[(1, "fwd")].num_rows == 40
+    assert groups[(1, "fwd")].schema.field("aligned_sequence").type == pa.large_string()
