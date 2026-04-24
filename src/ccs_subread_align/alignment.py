@@ -34,16 +34,20 @@ def _worker_init(ref_seqs: Dict[str, str]) -> None:
 # so use a smaller buffer than the composition-side 1M-row value.
 _ASSIGNED_SUBREAD_FLUSH_ROWS = 100_000
 
-# `aligned_sequence` uses large_string (int64 offsets) because a 100k-row
-# flush batch can exceed 2GB of sequence bytes for longer PacBio reads, which
-# overflows int32 offsets in both pa.array construction and later take().
+# Both variable-length columns use int64 offsets. `aligned_sequence` is
+# `large_string` because a 100k-row flush batch can exceed 2 GB of sequence
+# bytes. `position_map` is `large_list<int32>` because the aggregate element
+# count across chunks can exceed int32's 2^31 cap once the reader combines
+# chunks in `sort_by`/`take`; production hit this at ~476k subreads x ~17k
+# positions ~= 8 B elements. Wider write schema also keeps pa.array
+# construction safe at flush time if read lengths grow.
 _ASSIGNED_SUBREAD_SCHEMA = pa.schema(
     [
         pa.field("zmw", pa.int64()),
         pa.field("strand", pa.dictionary(pa.int8(), pa.string())),
         pa.field("subread_name", pa.string()),
         pa.field("aligned_sequence", pa.large_string()),
-        pa.field("position_map", pa.list_(pa.int32())),
+        pa.field("position_map", pa.large_list(pa.int32())),
         pa.field("identity", pa.float32()),
     ]
 )
@@ -316,7 +320,7 @@ def _assigned_batch_to_table(batch: List[Dict], report_margin: bool) -> pa.Table
         "strand": pa.array(strands, type=pa.string()).dictionary_encode(),
         "subread_name": pa.array(subread_names, type=pa.string()),
         "aligned_sequence": pa.array(aligned, type=pa.large_string()),
-        "position_map": pa.array(pos_maps, type=pa.list_(pa.int32())),
+        "position_map": pa.array(pos_maps, type=pa.large_list(pa.int32())),
         "identity": pa.array(identities, type=pa.float32()),
     }
     schema = _ASSIGNED_SUBREAD_SCHEMA

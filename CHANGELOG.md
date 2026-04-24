@@ -2,6 +2,11 @@
 
 <!--next-version-placeholder-->
 
+## v0.6.1 (23/04/2026)
+
+- Fix `pyarrow.lib.ArrowInvalid: offset overflow while concatenating arrays, consider casting input from list<element: int32> to large_list<item: int32> first` in `_group_subreads_from_parquet` on full-scale data. Sibling to the v0.5.1 string-column fix, one column over: `position_map: list<int32>` uses int32 element-offsets that overflow once aggregate child-buffer element count crosses 2^31 (~2.1B). At the user's production scale (~476k subreads × ~17k positions = ~8B elements) the `sort_by`/`take` combine step overflows. The reader now casts both `string`-family and `list`-family columns to int64-offset variants (`large_string`, `large_list`) before `sort_by`. The write schema for `position_map` is also widened to `pa.large_list(pa.int32())` so a 100k-row flush of long reads can never overflow at `pa.array` construction time. Legacy parquet files (`list<int32>`) auto-upgrade on read.
+- Why no faithful stress test: reproducing list-offset overflow needs ~8.4 GB of int32 child buffer (2^31 elements × 4 B). That exceeds practical CI/dev envelopes and isn't symmetric with the existing 2.4 GB `aligned_sequence` stress (strings overflow at 2 GB of bytes; `list<int32>` overflows at 4× that size in elements). Regression coverage is a cast-behavior test on a legacy-schema fixture plus a schema pin on `_ASSIGNED_SUBREAD_SCHEMA.position_map`; the existing 2.4 GB string-column stress still guards the `sort_by` combine path itself.
+
 ## v0.6.0 (23/04/2026)
 
 - **BREAKING**: `io.load_ccs_reads` is removed. Replaced by two functions with different scopes: `io.scan_zmw_to_chrom(bam, zmw_list)` (light pass that returns only the `{zmw: reference_name}` mapping, for use before alignment) and `io.stream_ccs_reads(bam, zmw_list, chrM_length)` (generator that yields CCS dicts one-at-a-time from the BAM, for use by composition). `query_to_ref` is no longer precomputed at load time; `composition.calculate_base_composition` parses `cigartuples` on demand in the worker (falling back to a precomputed `query_to_ref` when present so existing tests keep working). Removes the parent-side floor of ~21 GB at the 240k-CCS scale (~17 GB of `query_to_ref` arrays + ~4 GB of sequences) that used to sit resident from load through composition completion.

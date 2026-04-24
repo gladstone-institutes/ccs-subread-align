@@ -27,6 +27,13 @@ def test_assigned_subread_schema_uses_large_string():
     # construction, and later cross-batch take() stays safe.
     assert _ASSIGNED_SUBREAD_SCHEMA.field("aligned_sequence").type == pa.large_string()
 
+
+def test_assigned_subread_schema_uses_large_list():
+    # Regression guard: position_map must stay large_list<int32> so the
+    # reader's cross-chunk take()/sort_by stays safe once aggregate element
+    # count crosses 2^31. Production hit this at ~8 B total int32 elements.
+    assert _ASSIGNED_SUBREAD_SCHEMA.field("position_map").type == pa.large_list(pa.int32())
+
 # aligntools is a dev-only dependency used here as a ground-truth reference
 # for the hand-rolled CIGAR walkers in alignment.py.
 _LEGACY_OP_TO_CHAR = {0: "M", 1: "I", 2: "D", 3: "N", 4: "S", 5: "H", 6: "P", 7: "=", 8: "X"}

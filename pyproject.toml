@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ccs_subread_align"
-version = "0.6.0"
+version = "0.6.1"
 description = "Aligning PacBio subreads to their --by-strand CCS reads"
 authors = ["Natalie Gill"]
 license = "AGPL-3.0-only"

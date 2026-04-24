@@ -169,6 +169,20 @@ def _iter_worker_dfs(
             )
 
 
+def _widen_field(f: pa.Field) -> pa.Field:
+    """Promote at-risk columns to int64-offset variants before `sort_by`/`take`.
+
+    Extend here (not inline) so any future wide column type can be added in
+    one place.
+    """
+    t = f.type
+    if pa.types.is_string(t):
+        return f.with_type(pa.large_string())
+    if pa.types.is_list(t):
+        return f.with_type(pa.large_list(t.value_type))
+    return f
+
+
 def _group_subreads_from_parquet(
     path: Union[str, Path],
 ) -> Dict[Tuple[int, str], pa.Table]:
@@ -183,16 +197,16 @@ def _group_subreads_from_parquet(
     """
     table = pq.read_table(str(path))
     # `sort_by` internally calls `take(sort_indices)`, which combines column
-    # chunks into a single chunk and overflows int32 offsets on `string`
-    # columns once total bytes pass ~2 GB. Promote string columns to
-    # `large_string` (int64 offsets) first. No-op on fresh files; repairs
-    # legacy parquet written before the schema widening.
-    new_schema = pa.schema(
-        [
-            f.with_type(pa.large_string()) if pa.types.is_string(f.type) else f
-            for f in table.schema
-        ]
-    )
+    # chunks into a single chunk. Two overflow classes surface here when
+    # offsets are int32:
+    #   - `string` columns: byte offsets overflow once aggregate bytes cross
+    #     ~2 GB (`aligned_sequence` at scale).
+    #   - `list<int32>` columns: element offsets overflow once aggregate
+    #     element count crosses 2^31 (`position_map` at scale: ~8 B
+    #     elements in production).
+    # Promote both families to int64-offset variants. No-op on fresh files;
+    # repairs legacy parquet written before the schema widening.
+    new_schema = pa.schema([_widen_field(f) for f in table.schema])
     if new_schema != table.schema:
         table = table.cast(new_schema)
     # sort_by rejects dictionary-encoded columns, so decode `strand` to plain

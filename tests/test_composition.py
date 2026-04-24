@@ -464,7 +464,8 @@ def _write_alignment_parquet(
                     type=schema.field("aligned_sequence").type,
                 ),
                 "position_map": pa.array(
-                    [r["position_map"] for r in batch], type=pa.list_(pa.int32())
+                    [r["position_map"] for r in batch],
+                    type=schema.field("position_map").type,
                 ),
                 "identity": pa.array([r["identity"] for r in batch], type=pa.float32()),
             }
@@ -571,3 +572,34 @@ def test_group_subreads_from_parquet_no_overflow_over_2gb(tmp_path):
     assert set(groups.keys()) == {(1, "fwd")}
     assert groups[(1, "fwd")].num_rows == 40
     assert groups[(1, "fwd")].schema.field("aligned_sequence").type == pa.large_string()
+
+
+def test_group_subreads_from_parquet_handles_legacy_list_position_map(tmp_path):
+    """Legacy parquet with position_map: list<int32> must upgrade to large_list.
+
+    Pins the read-side cast for the list-column family. Without the
+    upgrade, production sort_by() raises ArrowInvalid once aggregate
+    element count crosses 2^31 (~8 GB of int32 child buffer, observed in
+    the 118k-ZMW production run at ~8 B elements). A faithful overflow
+    reproducer would require 8+ GB of memory; this small-data test is a
+    behavioral pin on the cast logic itself.
+    """
+    rows = [
+        _make_row(1, "fwd", "ACGT", idx=0, position_map=[0, 1, 2, 3]),
+        _make_row(1, "fwd", "ACGA", idx=1, position_map=[0, 1, 2, 3]),
+        _make_row(2, "rev", "TTTT", idx=2, position_map=[0, 1, 2, 3]),
+    ]
+    path = tmp_path / "legacy_list.parquet"
+    _write_alignment_parquet(path, rows, _legacy_string_schema())
+
+    on_disk = pq.read_table(path)
+    assert on_disk.schema.field("position_map").type == pa.list_(pa.int32())
+    assert on_disk.schema.field("aligned_sequence").type == pa.string()
+
+    groups = _group_subreads_from_parquet(path)
+    assert set(groups.keys()) == {(1, "fwd"), (2, "rev")}
+    assert groups[(1, "fwd")].num_rows == 2
+    assert groups[(2, "rev")].num_rows == 1
+    for tbl in groups.values():
+        assert tbl.schema.field("position_map").type == pa.large_list(pa.int32())
+        assert tbl.schema.field("aligned_sequence").type == pa.large_string()
