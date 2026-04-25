@@ -1,10 +1,12 @@
 """Base composition calculation from subread-to-CCS alignments."""
 
+import gc
+import json
 import logging
 from collections import defaultdict
 from multiprocessing import cpu_count
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -13,7 +15,11 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from ccs_subread_align._pool import get_pool
-from ccs_subread_align.alignment import parse_cigar_to_reference_map
+from ccs_subread_align.alignment import (
+    _BUCKET_MANIFEST_NAME,
+    _bucket_path,
+    parse_cigar_to_reference_map,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -262,8 +268,89 @@ def _pa_table_to_subread_dicts(table: pa.Table) -> List[Dict]:
     return out
 
 
+def _iter_dfs_for_stream(
+    ccs_stream: Iterable[Dict],
+    subreads_by_zmw_strand: Dict[Tuple[int, str], Union[List[Dict], pa.Table]],
+    from_parquet: bool,
+    ref_seqs: Dict[str, str],
+    zmw_to_chrom: Dict[int, str],
+    chrM_length: int,
+    n_cores: int,
+    desc: str,
+) -> Iterator[Optional[pd.DataFrame]]:
+    """Drive ``_iter_worker_dfs`` from a single CCS stream.
+
+    Shared by both the single-file and bucketed read paths; the bucketed
+    path reuses this per bucket with a pre-filtered CCS stream.
+    """
+    def _iter_work_items() -> Iterator[Tuple]:
+        for ccs in ccs_stream:
+            chrom = zmw_to_chrom.get(ccs["zmw"])
+            if chrom is None or chrom not in ref_seqs:
+                continue
+            key = (ccs["zmw"], ccs["strand"])
+            group = subreads_by_zmw_strand.get(key)
+            if group is None:
+                matched: List[Dict] = []
+            elif from_parquet:
+                matched = _pa_table_to_subread_dicts(group)
+            else:
+                matched = group
+            yield (ccs, matched, ref_seqs[chrom], chrM_length)
+
+    # total=None: ccs stream is walked once, so tqdm shows rate + elapsed
+    # instead of a percent.
+    yield from tqdm(
+        _iter_worker_dfs(_iter_work_items(), n_cores),
+        total=None,
+        desc=desc,
+    )
+
+
+def _iter_bucket_dfs(
+    bucket_dir: Path,
+    manifest: Dict,
+    ccs_reads_factory: Callable[[], Iterable[Dict]],
+    ref_seqs: Dict[str, str],
+    zmw_to_chrom: Dict[int, str],
+    chrM_length: int,
+    n_cores: int,
+) -> Iterator[Optional[pd.DataFrame]]:
+    """Iterate buckets in index order, yielding composition DataFrames.
+
+    Each bucket's grouper dict is built inside a nested generator so it
+    goes out of scope as soon as the bucket's CCS stream is exhausted,
+    and ``gc.collect()`` runs between buckets to reclaim the pyarrow
+    buffers before the next bucket loads.
+    """
+    n_buckets = int(manifest["n_buckets"])
+    for i in range(n_buckets):
+        path = _bucket_path(bucket_dir, i)
+        if not path.exists():
+            logger.info(f"Bucket {i}/{n_buckets - 1}: empty, skipping")
+            continue
+        subreads = _group_subreads_from_parquet(path)
+        logger.info(
+            f"Bucket {i}/{n_buckets - 1}: {len(subreads)} (zmw, strand) groups"
+        )
+        filtered = (
+            ccs for ccs in ccs_reads_factory()
+            if ccs["zmw"] % n_buckets == i
+        )
+        yield from _iter_dfs_for_stream(
+            filtered, subreads, True, ref_seqs, zmw_to_chrom,
+            chrM_length, n_cores, f"Bucket {i}/{n_buckets - 1}",
+        )
+        # Explicit drop + collect: pyarrow buffers are reference-counted,
+        # and dropping the dict now (rather than waiting for generator
+        # frame teardown at function exit) keeps peak memory at one
+        # bucket, not all N.
+        del subreads
+        gc.collect()
+
+
 def calculate_all_base_compositions(
-    ccs_reads: Iterable[Dict],
+    ccs_reads: Union[Iterable[Dict], Callable[[], Iterable[Dict]]],
     assigned_subreads: Union[List[Dict], str, Path],
     ref_seqs: Dict[str, str],
     zmw_to_chrom: Dict[int, str],
@@ -275,15 +362,19 @@ def calculate_all_base_compositions(
     Calculate base composition for all CCS reads.
 
     Args:
-        ccs_reads: Iterable of CCS read dicts. Typically the iterator
-            returned by ``io.stream_ccs_reads``; a ``List[Dict]`` is also
-            accepted. Iterated exactly once — the function does not
-            pre-count, so tqdm shows rate progress instead of a percent.
-        assigned_subreads: Either a ``List[Dict]`` of assigned subread records
-            (legacy in-memory path) or a path to a parquet file written by
-            ``process_subread_alignment(..., output_path=...)``. The parquet
-            path is preferred at full scale: it loads as a pyarrow Table with
-            tight columnar dtypes instead of a fat Python list of dicts.
+        ccs_reads: Either an ``Iterable[Dict]`` of CCS read dicts (iterated
+            exactly once) or a zero-arg callable factory that returns a
+            fresh iterable each time it's called. The factory form is
+            required when ``assigned_subreads`` is a bucketed directory,
+            because the CCS stream is consumed once per bucket. Wrap the
+            single-use generator from ``io.stream_ccs_reads`` with
+            ``lambda: io.stream_ccs_reads(...)``.
+        assigned_subreads: One of: a ``List[Dict]`` of assigned subread
+            records (legacy in-memory path); a path to a single parquet
+            file written by ``process_subread_alignment(..., output_path=...)``;
+            or a path to a *directory* of bucketed parquet files written
+            with ``n_buckets > 1`` (composition loads buckets one at a time
+            so peak memory stays at ``total / n_buckets``).
         ref_seqs: Dictionary mapping chromosome names to reference sequences.
         zmw_to_chrom: Dictionary mapping ZMW to chromosome name.
         chrM_length: Genome length for coordinate normalization.
@@ -300,42 +391,58 @@ def calculate_all_base_compositions(
     if n_cores is None:
         n_cores = cpu_count()
 
-    subreads_by_zmw_strand: Dict[Tuple[int, str], Union[List[Dict], pa.Table]]
     from_parquet = isinstance(assigned_subreads, (str, Path))
-    if from_parquet:
-        subreads_by_zmw_strand = _group_subreads_from_parquet(assigned_subreads)
+    is_bucketed = from_parquet and Path(assigned_subreads).is_dir()
+
+    df_iter: Iterator[Optional[pd.DataFrame]]
+    if is_bucketed:
+        bucket_dir = Path(assigned_subreads)
+        manifest_path = bucket_dir / _BUCKET_MANIFEST_NAME
+        if not manifest_path.exists():
+            raise ValueError(
+                f"Bucketed subread directory {bucket_dir} is missing "
+                f"{_BUCKET_MANIFEST_NAME}. The writer was either interrupted "
+                "or the path is wrong; a partial directory is never safe to "
+                "read."
+            )
+        manifest = json.loads(manifest_path.read_text())
+        if not callable(ccs_reads):
+            raise TypeError(
+                "Bucketed assigned_subreads requires ccs_reads to be a "
+                "zero-arg callable factory returning an Iterable[Dict]; the "
+                "CCS stream is iterated once per bucket. Wrap with "
+                "`lambda: io.stream_ccs_reads(ccs_bam, zmw_list, chrM_length)`."
+            )
+        logger.info(
+            f"Reading bucketed subreads from {bucket_dir} "
+            f"(n_buckets={manifest['n_buckets']})"
+        )
+        df_iter = _iter_bucket_dfs(
+            bucket_dir, manifest, ccs_reads, ref_seqs, zmw_to_chrom,
+            chrM_length, n_cores,
+        )
     else:
-        grouped: Dict[Tuple[int, str], List[Dict]] = defaultdict(list)
-        for sr in assigned_subreads:
-            grouped[(sr["zmw"], sr["strand"])].append(sr)
-        subreads_by_zmw_strand = grouped
+        subreads_by_zmw_strand: Dict[Tuple[int, str], Union[List[Dict], pa.Table]]
+        if from_parquet:
+            subreads_by_zmw_strand = _group_subreads_from_parquet(assigned_subreads)
+        else:
+            grouped: Dict[Tuple[int, str], List[Dict]] = defaultdict(list)
+            for sr in assigned_subreads:
+                grouped[(sr["zmw"], sr["strand"])].append(sr)
+            subreads_by_zmw_strand = grouped
 
-    logger.info(f"{len(subreads_by_zmw_strand)} unique (zmw, strand) groups")
+        logger.info(f"{len(subreads_by_zmw_strand)} unique (zmw, strand) groups")
 
-    def _iter_work_items() -> Iterator[Tuple]:
-        for ccs in ccs_reads:
-            chrom = zmw_to_chrom.get(ccs["zmw"])
-            if chrom is None or chrom not in ref_seqs:
-                continue
-            key = (ccs["zmw"], ccs["strand"])
-            group = subreads_by_zmw_strand.get(key)
-            if group is None:
-                matched: List[Dict] = []
-            elif from_parquet:
-                matched = _pa_table_to_subread_dicts(group)
-            else:
-                matched = group
-            yield (ccs, matched, ref_seqs[chrom], chrM_length)
-
-    desc = f"Processing CCS reads ({n_cores} cores)" if n_cores != 1 else "Processing CCS reads"
-    # total=None: ccs_reads is an iterable we only walk once, so tqdm shows
-    # rate + elapsed instead of a percent. Callers with an upfront count
-    # can wrap their own tqdm.
-    df_iter = tqdm(
-        _iter_worker_dfs(_iter_work_items(), n_cores),
-        total=None,
-        desc=desc,
-    )
+        source: Iterable[Dict] = ccs_reads() if callable(ccs_reads) else ccs_reads
+        desc = (
+            f"Processing CCS reads ({n_cores} cores)"
+            if n_cores != 1
+            else "Processing CCS reads"
+        )
+        df_iter = _iter_dfs_for_stream(
+            source, subreads_by_zmw_strand, from_parquet, ref_seqs,
+            zmw_to_chrom, chrM_length, n_cores, desc,
+        )
 
     if output_path is not None:
         output_path = Path(output_path)

@@ -2,6 +2,36 @@
 
 <!--next-version-placeholder-->
 
+## v0.7.0 (24/04/2026)
+
+- `alignment.process_subread_alignment` gains `n_buckets: int = 1`. When `n_buckets > 1`, `output_path` is treated as a directory and assigned-subread rows are sharded across `bucket_{i:02d}.parquet` files keyed by `zmw % n_buckets`. A `manifest.json` (`{"n_buckets": N, "schema_version": "0.7", "has_margin": bool}`) is written last as the atomic completion marker — readers must refuse to proceed without it. Per-bucket flush threshold is `_ASSIGNED_SUBREAD_FLUSH_ROWS // n_buckets`, so total write-side buffered rows stays bounded at ~100k regardless of N (otherwise 16 independent 100k-row buffers at full scale would hold ~48 GB of `aligned_sequence` across all buckets). Default `n_buckets=1` preserves the single-file write path byte-for-byte.
+- `composition.calculate_all_base_compositions` detects a bucketed directory for `assigned_subreads` and processes buckets one at a time — load bucket → filter CCS by `zmw % n_buckets` → compute → drop grouper → `gc.collect()` → next bucket. Peak memory stays at `total / n_buckets` on the read side. Output composition parquet stays a single file. Missing `manifest.json` raises `ValueError` (never silently treated as "empty").
+- `composition.calculate_all_base_compositions` accepts `Union[Iterable[Dict], Callable[[], Iterable[Dict]]]` for `ccs_reads`. The factory form is **required** when `assigned_subreads` is a bucketed directory, because the CCS stream is consumed once per bucket; passing a plain iterable raises `TypeError` with a migration hint. Existing single-file callers keep working unchanged (iterable form still accepted).
+- Memory on the 30 GB production repro (`nomod_REPLIg_HEK` pos 13493, 118k no-mismatch ZMWs, 2026-04-24): expected step-6 peak drops from OOM (>144 GB) to ~10-15 GB per bucket with `n_buckets=16`.
+
+### Migration
+
+Single-file callers need no change. Bucketed callers set `n_buckets` and wrap the CCS generator:
+
+```diff
+-aligned_path = output_dir / f".{name}_aligned_subreads.parquet"
++aligned_path = output_dir / f".{name}_aligned_subreads"  # now a directory
+ process_subread_alignment(
+-    zmw_list, subreads, ref_seqs, zmw_to_chrom, chrM_length, min_identity, output_path=aligned_path,
++    zmw_list, subreads, ref_seqs, zmw_to_chrom, chrM_length, min_identity,
++    output_path=aligned_path, n_buckets=config.get("n_buckets", 16),
+ )
+ calculate_all_base_compositions(
+-    io.stream_ccs_reads(ccs_bam, zmw_list, chrM_length),
++    lambda: io.stream_ccs_reads(ccs_bam, zmw_list, chrM_length),
+     aligned_path, ref_seqs, zmw_to_chrom, chrM_length, output_path=comp_path,
+ )
+```
+
+Resume logic in pipeline scripts should check `(aligned_path / "manifest.json").exists()` rather than `aligned_path.exists()` — a partial directory without a manifest is never valid. Cleanup becomes `shutil.rmtree(aligned_path)` instead of `.unlink()`.
+
+Downstream wiring in `GB-SS-1460` (pipeline scripts + alignment-summary TSV loop over `bucket_*.parquet`) is out of scope for this PR and lives in that repo.
+
 ## v0.6.1 (23/04/2026)
 
 - Fix `pyarrow.lib.ArrowInvalid: offset overflow while concatenating arrays, consider casting input from list<element: int32> to large_list<item: int32> first` in `_group_subreads_from_parquet` on full-scale data. Sibling to the v0.5.1 string-column fix, one column over: `position_map: list<int32>` uses int32 element-offsets that overflow once aggregate child-buffer element count crosses 2^31 (~2.1B). At the user's production scale (~476k subreads × ~17k positions = ~8B elements) the `sort_by`/`take` combine step overflows. The reader now casts both `string`-family and `list`-family columns to int64-offset variants (`large_string`, `large_list`) before `sort_by`. The write schema for `position_map` is also widened to `pa.large_list(pa.int32())` so a 100k-row flush of long reads can never overflow at `pa.array` construction time. Legacy parquet files (`list<int32>`) auto-upgrade on read.

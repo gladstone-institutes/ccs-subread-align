@@ -574,6 +574,208 @@ def test_group_subreads_from_parquet_no_overflow_over_2gb(tmp_path):
     assert groups[(1, "fwd")].schema.field("aligned_sequence").type == pa.large_string()
 
 
+# --- bucketed read path ---
+
+
+def _write_bucketed_from_rows(
+    root: Path,
+    rows: list,
+    n_buckets: int,
+    schema: pa.Schema = None,
+) -> None:
+    """Split rows by zmw % n_buckets and write one parquet per bucket, plus
+    the completion manifest. Mirrors the production writer's layout so the
+    reader tests can use a lightweight synthetic input."""
+    import json as _json
+
+    from ccs_subread_align.alignment import _ASSIGNED_SUBREAD_SCHEMA
+
+    if schema is None:
+        schema = _ASSIGNED_SUBREAD_SCHEMA
+    root.mkdir(parents=True, exist_ok=True)
+    by_bucket: dict = {i: [] for i in range(n_buckets)}
+    for r in rows:
+        by_bucket[r["zmw"] % n_buckets].append(r)
+    for i, bucket_rows in by_bucket.items():
+        if not bucket_rows:
+            continue
+        _write_alignment_parquet(root / f"bucket_{i:02d}.parquet", bucket_rows, schema)
+    (root / "manifest.json").write_text(
+        _json.dumps({"n_buckets": n_buckets, "schema_version": "0.7", "has_margin": False})
+    )
+
+
+def test_calculate_all_base_compositions_bucketed_matches_single(tmp_path):
+    """Composition output from a bucketed dir must match the single-file
+    output row-for-row on the same synthetic inputs."""
+    # Build a handful of CCS reads and subreads across multiple ZMWs so
+    # bucketing actually splits the data.
+    ccs_reads = [
+        _make_ccs_read("ACGTACGT", zmw=z, strand="fwd") for z in range(8)
+    ]
+    subreads = [
+        _make_subread("ACGTACGT", [0, 1, 2, 3, 4, 5, 6, 7], zmw=z, strand="fwd")
+        for z in range(8)
+    ]
+    ref_seq = "ACGT" * 5000
+    ref_seqs = {"chrM": ref_seq}
+    zmw_to_chrom = {z: "chrM" for z in range(8)}
+
+    # Single-file path: write a single parquet via the writer helper.
+    from ccs_subread_align.alignment import _ASSIGNED_SUBREAD_SCHEMA
+    single_path = tmp_path / "single.parquet"
+    _write_alignment_parquet(
+        single_path,
+        [
+            {
+                "zmw": sr["zmw"],
+                "strand": sr["strand"],
+                "subread_name": sr["subread_name"],
+                "aligned_sequence": sr["aligned_sequence"],
+                "position_map": sr["position_map"].tolist(),
+                "identity": sr["identity"],
+            }
+            for sr in subreads
+        ],
+        _ASSIGNED_SUBREAD_SCHEMA,
+    )
+
+    # Bucketed path: same rows, split into 4 buckets.
+    bucket_dir = tmp_path / "bucketed"
+    _write_bucketed_from_rows(
+        bucket_dir,
+        [
+            {
+                "zmw": sr["zmw"],
+                "strand": sr["strand"],
+                "subread_name": sr["subread_name"],
+                "aligned_sequence": sr["aligned_sequence"],
+                "position_map": sr["position_map"].tolist(),
+                "identity": sr["identity"],
+            }
+            for sr in subreads
+        ],
+        n_buckets=4,
+    )
+
+    df_single = calculate_all_base_compositions(
+        ccs_reads=list(ccs_reads),
+        assigned_subreads=single_path,
+        ref_seqs=ref_seqs,
+        zmw_to_chrom=zmw_to_chrom,
+        chrM_length=CHRM_LENGTH,
+        n_cores=1,
+    )
+
+    # Bucketed reader requires a factory (ccs stream replayed per bucket).
+    df_bucketed = calculate_all_base_compositions(
+        ccs_reads=lambda: iter(ccs_reads),
+        assigned_subreads=bucket_dir,
+        ref_seqs=ref_seqs,
+        zmw_to_chrom=zmw_to_chrom,
+        chrM_length=CHRM_LENGTH,
+        n_cores=1,
+    )
+
+    assert len(df_bucketed) == len(df_single) > 0
+    sort_cols = ["zmw", "strand", "ccs_pos"]
+    left = df_single.sort_values(sort_cols).reset_index(drop=True)
+    right = df_bucketed.sort_values(sort_cols).reset_index(drop=True)
+    for col in sort_cols + [
+        "ref_pos", "A_count", "T_count", "C_count", "G_count", "N_count",
+        "total_subreads",
+    ]:
+        assert (left[col].to_numpy() == right[col].to_numpy()).all(), col
+    assert np.allclose(
+        left["agreement_fraction"].to_numpy(),
+        right["agreement_fraction"].to_numpy(),
+        equal_nan=True,
+    )
+
+
+def test_calculate_all_base_compositions_bucketed_requires_callable(tmp_path):
+    """Passing a plain iterable for ccs_reads when pointed at a bucketed
+    directory must raise TypeError — the stream would be exhausted after
+    the first bucket."""
+    rows = [
+        _make_row(1, "fwd", "ACGT", idx=0),
+        _make_row(2, "fwd", "ACGT", idx=1),
+    ]
+    bucket_dir = tmp_path / "bucketed"
+    _write_bucketed_from_rows(bucket_dir, rows, n_buckets=2)
+
+    with pytest.raises(TypeError, match="callable"):
+        calculate_all_base_compositions(
+            ccs_reads=[],  # plain list, not a factory
+            assigned_subreads=bucket_dir,
+            ref_seqs={"chrM": "ACGT" * 5000},
+            zmw_to_chrom={},
+            chrM_length=CHRM_LENGTH,
+            n_cores=1,
+        )
+
+
+def test_calculate_all_base_compositions_bucketed_missing_manifest_errors(tmp_path):
+    """A directory of bucket files without manifest.json is treated as
+    incomplete — reader must refuse to proceed, not silently return empty."""
+    rows = [_make_row(1, "fwd", "ACGT")]
+    bucket_dir = tmp_path / "partial"
+    bucket_dir.mkdir()
+    from ccs_subread_align.alignment import _ASSIGNED_SUBREAD_SCHEMA
+    _write_alignment_parquet(
+        bucket_dir / "bucket_00.parquet", rows, _ASSIGNED_SUBREAD_SCHEMA
+    )
+    # No manifest.json.
+
+    with pytest.raises(ValueError, match="manifest.json"):
+        calculate_all_base_compositions(
+            ccs_reads=lambda: iter([]),
+            assigned_subreads=bucket_dir,
+            ref_seqs={"chrM": "ACGT" * 5000},
+            zmw_to_chrom={},
+            chrM_length=CHRM_LENGTH,
+            n_cores=1,
+        )
+
+
+def test_calculate_all_base_compositions_bucketed_skips_empty_buckets(tmp_path):
+    """Buckets with no matching ZMWs produce no parquet file; the reader
+    must treat missing bucket files as empty, not as an error."""
+    # All ZMWs are even, so bucket 1 of n_buckets=2 is empty.
+    ccs_reads = [_make_ccs_read("ACGT", zmw=z, strand="fwd") for z in (0, 2, 4)]
+    subreads = [
+        _make_subread("ACGT", [0, 1, 2, 3], zmw=z, strand="fwd") for z in (0, 2, 4)
+    ]
+    rows = [
+        {
+            "zmw": sr["zmw"],
+            "strand": sr["strand"],
+            "subread_name": sr["subread_name"],
+            "aligned_sequence": sr["aligned_sequence"],
+            "position_map": sr["position_map"].tolist(),
+            "identity": sr["identity"],
+        }
+        for sr in subreads
+    ]
+    bucket_dir = tmp_path / "bucketed"
+    _write_bucketed_from_rows(bucket_dir, rows, n_buckets=2)
+    # Sanity: bucket_01.parquet must not exist (all even zmws).
+    assert not (bucket_dir / "bucket_01.parquet").exists()
+    assert (bucket_dir / "bucket_00.parquet").exists()
+
+    df = calculate_all_base_compositions(
+        ccs_reads=lambda: iter(ccs_reads),
+        assigned_subreads=bucket_dir,
+        ref_seqs={"chrM": "ACGT" * 5000},
+        zmw_to_chrom={0: "chrM", 2: "chrM", 4: "chrM"},
+        chrM_length=CHRM_LENGTH,
+        n_cores=1,
+    )
+    # 3 reads × 4 positions each.
+    assert len(df) == 12
+    assert (df["total_subreads"] == 1).all()
+
+
 def test_group_subreads_from_parquet_handles_legacy_list_position_map(tmp_path):
     """Legacy parquet with position_map: list<int32> must upgrade to large_list.
 

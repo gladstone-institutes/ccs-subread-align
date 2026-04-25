@@ -574,3 +574,150 @@ def test_process_subread_alignment_streaming_empty(tmp_path):
     )
     assert returned == out_path
     assert not out_path.exists()
+
+
+# --- process_subread_alignment bucketed output ---
+
+
+def _build_synthetic_bucket_inputs(ref_seq, n_zmws=8):
+    """Build synthetic subreads covering a range of ZMWs, using slices of the
+    real reference so alignment assigns deterministically.
+
+    Returns (zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom).
+    """
+    zmw_list = list(range(n_zmws))
+    subreads_by_zmw = {}
+    for zmw in zmw_list:
+        # Different slice per ZMW so subread_name's are distinct and rows
+        # survive a concat+sort equality check.
+        start = 200 + zmw * 50
+        seq = ref_seq[start : start + 150]
+        subreads_by_zmw[zmw] = [{"read_name": f"movie/{zmw}/0_150", "query_sequence": seq}]
+    ref_seqs = {"chrM": ref_seq}
+    zmw_to_chrom = {zmw: "chrM" for zmw in zmw_list}
+    return zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom
+
+
+@pytest.mark.skipif(not REF_FASTA.exists(), reason="Test FASTA not available")
+def test_process_subread_alignment_bucketed_writes_manifest_last(ref_seq, tmp_path):
+    """manifest.json is the atomic completion marker — must be written last."""
+    from ccs_subread_align.alignment import process_subread_alignment
+
+    zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom = _build_synthetic_bucket_inputs(
+        ref_seq
+    )
+
+    out_dir = tmp_path / "bucketed"
+    returned = process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=1, output_path=out_dir, n_buckets=4,
+    )
+
+    assert returned == out_dir
+    assert out_dir.is_dir()
+    manifest = out_dir / "manifest.json"
+    assert manifest.exists()
+
+    bucket_files = sorted(out_dir.glob("bucket_*.parquet"))
+    assert len(bucket_files) > 0
+    # Manifest mtime must be >= every bucket file's mtime. Use >= rather than
+    # > to tolerate filesystems with coarse mtime granularity (HFS+).
+    manifest_mtime = manifest.stat().st_mtime
+    for bf in bucket_files:
+        assert manifest_mtime >= bf.stat().st_mtime, bf
+
+    import json as _json
+    m = _json.loads(manifest.read_text())
+    assert m["n_buckets"] == 4
+    assert m["schema_version"] == "0.7"
+    assert m["has_margin"] is False
+
+
+@pytest.mark.skipif(not REF_FASTA.exists(), reason="Test FASTA not available")
+def test_process_subread_alignment_bucketed_partitions_by_zmw_mod_n(ref_seq, tmp_path):
+    """Every row in bucket_{i} must satisfy zmw % N == i."""
+    import pyarrow.parquet as pq
+
+    from ccs_subread_align.alignment import process_subread_alignment
+
+    zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom = _build_synthetic_bucket_inputs(
+        ref_seq, n_zmws=8
+    )
+
+    out_dir = tmp_path / "bucketed"
+    process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=1, output_path=out_dir, n_buckets=4,
+    )
+
+    for bf in sorted(out_dir.glob("bucket_*.parquet")):
+        bucket_idx = int(bf.stem.split("_")[1])
+        table = pq.read_table(bf)
+        zmws = table.column("zmw").to_pylist()
+        assert zmws, f"bucket {bucket_idx} file exists but has no rows"
+        for z in zmws:
+            assert z % 4 == bucket_idx, (z, bucket_idx)
+
+
+@pytest.mark.skipif(not REF_FASTA.exists(), reason="Test FASTA not available")
+def test_process_subread_alignment_bucketed_union_equals_single(ref_seq, tmp_path):
+    """Concat of bucket files must match the single-file output row-for-row."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from ccs_subread_align.alignment import process_subread_alignment
+
+    zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom = _build_synthetic_bucket_inputs(
+        ref_seq, n_zmws=8
+    )
+
+    single_path = tmp_path / "single.parquet"
+    process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=1, output_path=single_path, n_buckets=1,
+    )
+
+    bucket_dir = tmp_path / "bucketed"
+    process_subread_alignment(
+        zmw_list, subreads_by_zmw, ref_seqs, zmw_to_chrom, CHRM_LENGTH,
+        min_identity=0.5, n_cores=1, output_path=bucket_dir, n_buckets=4,
+    )
+
+    single = pq.read_table(single_path)
+    bucket_tables = [pq.read_table(p) for p in sorted(bucket_dir.glob("bucket_*.parquet"))]
+    bucketed = pa.concat_tables(bucket_tables, promote_options="permissive")
+
+    assert bucketed.num_rows == single.num_rows
+
+    # Sort both by subread_name (unique) for a stable row-order comparison.
+    single_sorted = single.sort_by([("subread_name", "ascending")])
+    bucketed_sorted = bucketed.sort_by([("subread_name", "ascending")])
+    assert (
+        single_sorted.column("zmw").to_pylist()
+        == bucketed_sorted.column("zmw").to_pylist()
+    )
+    assert (
+        single_sorted.column("aligned_sequence").to_pylist()
+        == bucketed_sorted.column("aligned_sequence").to_pylist()
+    )
+    assert (
+        single_sorted.column("subread_name").to_pylist()
+        == bucketed_sorted.column("subread_name").to_pylist()
+    )
+
+
+def test_process_subread_alignment_bucketed_rejects_n_buckets_without_output(tmp_path):
+    """n_buckets > 1 without output_path must be rejected — no ambiguous behavior."""
+    from ccs_subread_align.alignment import process_subread_alignment
+
+    with pytest.raises(ValueError, match="requires output_path"):
+        process_subread_alignment(
+            zmw_list=[1],
+            subreads_by_zmw={1: [{"read_name": "m/1/0", "query_sequence": "A" * 100}]},
+            ref_seqs={"chrM": "ACGT" * 5000},
+            zmw_to_chrom={1: "chrM"},
+            chrM_length=CHRM_LENGTH,
+            min_identity=0.5,
+            n_cores=1,
+            n_buckets=4,
+        )

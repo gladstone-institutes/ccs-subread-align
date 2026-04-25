@@ -1,5 +1,6 @@
 """Core alignment functions for assigning PacBio subreads to strands."""
 
+import json
 import logging
 import re
 from functools import partial
@@ -332,6 +333,15 @@ def _assigned_batch_to_table(batch: List[Dict], report_margin: bool) -> pa.Table
     return pa.Table.from_pydict(cols, schema=schema)
 
 
+_BUCKET_MANIFEST_NAME = "manifest.json"
+_BUCKET_SCHEMA_VERSION = "0.7"
+
+
+def _bucket_path(output_dir: Path, bucket_idx: int) -> Path:
+    """Canonical bucket file path inside a bucketed output directory."""
+    return output_dir / f"bucket_{bucket_idx:02d}.parquet"
+
+
 def process_subread_alignment(
     zmw_list: List[int],
     subreads_by_zmw: Dict[int, List[Dict]],
@@ -342,6 +352,7 @@ def process_subread_alignment(
     n_cores: Optional[int] = None,
     report_margin: bool = False,
     output_path: Optional[Union[str, Path]] = None,
+    n_buckets: int = 1,
 ) -> Union[List[Dict], Path]:
     """
     Align subreads to reference and assign to strands.
@@ -360,12 +371,24 @@ def process_subread_alignment(
             materializing the full ``List[Dict]`` of assignments, which can
             reach tens of GB at full scale. If None, return the legacy
             ``List[Dict]`` (safe only at small scale).
+        n_buckets: When > 1, ``output_path`` is treated as a directory and
+            rows are sharded across ``bucket_{i:02d}.parquet`` files keyed by
+            ``zmw % n_buckets``. A ``manifest.json`` is written last as the
+            atomic completion marker. Downstream composition reads buckets
+            one at a time so the read-side peak memory stays bounded at
+            ``total / n_buckets``. Requires ``output_path`` to be set.
+            Default ``1`` preserves the single-file write path.
 
     Returns:
         List of assigned subread dictionaries, or ``output_path`` if streaming.
     """
     if n_cores is None:
         n_cores = cpu_count()
+
+    if n_buckets < 1:
+        raise ValueError(f"n_buckets must be >= 1, got {n_buckets}")
+    if n_buckets > 1 and output_path is None:
+        raise ValueError("n_buckets > 1 requires output_path to be set")
 
     skipped_zmws = {
         zmw: zmw_to_chrom.get(zmw)
@@ -412,7 +435,7 @@ def process_subread_alignment(
         _iter_subreads_for_pool(), worker, n_cores, ref_seqs, total
     )
 
-    if output_path is not None:
+    if output_path is not None and n_buckets == 1:
         output_path = Path(output_path)
         schema = (
             _ASSIGNED_SUBREAD_SCHEMA_MARGIN if report_margin else _ASSIGNED_SUBREAD_SCHEMA
@@ -461,6 +484,71 @@ def process_subread_alignment(
                 f"Streamed {total_written} assigned subreads "
                 f"(fwd={n_fwd}, rev={n_rev}) to: {output_path}"
             )
+        return output_path
+
+    if output_path is not None and n_buckets > 1:
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        schema = (
+            _ASSIGNED_SUBREAD_SCHEMA_MARGIN if report_margin else _ASSIGNED_SUBREAD_SCHEMA
+        )
+        # Divide the global flush budget across buckets so total buffered
+        # rows stays bounded at ~_ASSIGNED_SUBREAD_FLUSH_ROWS regardless of
+        # n_buckets. Otherwise N independent 100k-row buffers at full scale
+        # would hold ~48 GB of aligned_sequence across all buckets.
+        per_bucket_flush = max(1, _ASSIGNED_SUBREAD_FLUSH_ROWS // n_buckets)
+        writers: List[Optional[pq.ParquetWriter]] = [None] * n_buckets
+        buffers: List[List[Dict]] = [[] for _ in range(n_buckets)]
+        n_fwd = n_rev = 0
+        total_written = 0
+
+        def _flush(idx: int) -> None:
+            nonlocal total_written
+            buf = buffers[idx]
+            if not buf:
+                return
+            table = _assigned_batch_to_table(buf, report_margin)
+            if writers[idx] is None:
+                writers[idx] = pq.ParquetWriter(
+                    _bucket_path(output_path, idx), schema, compression="zstd"
+                )
+            writers[idx].write_table(table)
+            total_written += table.num_rows
+            buf.clear()
+
+        try:
+            for r in result_iter:
+                if r is None:
+                    continue
+                if r["strand"] == "fwd":
+                    n_fwd += 1
+                else:
+                    n_rev += 1
+                idx = int(r["zmw"]) % n_buckets
+                buffers[idx].append(r)
+                if len(buffers[idx]) >= per_bucket_flush:
+                    _flush(idx)
+            for idx in range(n_buckets):
+                _flush(idx)
+        finally:
+            for w in writers:
+                if w is not None:
+                    w.close()
+
+        # Manifest is the atomic completion marker: readers must require it,
+        # so write it only after every bucket writer has closed cleanly.
+        manifest = {
+            "n_buckets": n_buckets,
+            "schema_version": _BUCKET_SCHEMA_VERSION,
+            "has_margin": report_margin,
+        }
+        (output_path / _BUCKET_MANIFEST_NAME).write_text(json.dumps(manifest))
+
+        populated = sum(1 for w in writers if w is not None)
+        logger.info(
+            f"Streamed {total_written} assigned subreads "
+            f"(fwd={n_fwd}, rev={n_rev}) across {populated}/{n_buckets} buckets to: {output_path}"
+        )
         return output_path
 
     assigned = [r for r in result_iter if r is not None]
