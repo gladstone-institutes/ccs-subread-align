@@ -805,3 +805,56 @@ def test_group_subreads_from_parquet_handles_legacy_list_position_map(tmp_path):
     for tbl in groups.values():
         assert tbl.schema.field("position_map").type == pa.large_list(pa.int32())
         assert tbl.schema.field("aligned_sequence").type == pa.large_string()
+
+
+# --- zmw_strand high-cardinality regression (v0.7.1) ---
+
+
+def _write_high_cardinality_composition(path: Path, n_ccs: int) -> None:
+    """Stream a composition parquet from n_ccs CCS reads, each with a distinct zmw."""
+    ccs_reads = [_make_ccs_read("ACGT", zmw=i, strand="fwd") for i in range(n_ccs)]
+    subreads = [
+        _make_subread("ACGT", [0, 1, 2, 3], zmw=i, strand="fwd") for i in range(n_ccs)
+    ]
+    calculate_all_base_compositions(
+        ccs_reads=ccs_reads,
+        assigned_subreads=subreads,
+        ref_seqs={"chrM": "ACGT" * 5000},
+        zmw_to_chrom={i: "chrM" for i in range(n_ccs)},
+        chrM_length=CHRM_LENGTH,
+        n_cores=1,
+        output_path=path,
+    )
+
+
+def test_composition_zmw_strand_high_cardinality_round_trip(tmp_path):
+    """Pre-v0.7.1 writer emitted dict<int8, string> for zmw_strand; readers overflowed past 127 distinct values per row group."""
+    path = tmp_path / "high_cardinality.parquet"
+    _write_high_cardinality_composition(path, n_ccs=200)
+
+    pf = pq.ParquetFile(path)
+    for _ in pf.iter_batches():
+        pass
+    pf.read_row_group(0)
+
+
+def test_composition_parquet_zmw_strand_field_is_plain_string(tmp_path):
+    """Structural invariant guarding against a Categorical regression at the per-CCS write site."""
+    path = tmp_path / "any_scale.parquet"
+    _write_high_cardinality_composition(path, n_ccs=4)
+
+    field_type = pq.ParquetFile(path).schema_arrow.field("zmw_strand").type
+    assert field_type in (pa.string(), pa.large_string()), (
+        f"zmw_strand serialized as {field_type!r}; must be plain string"
+    )
+
+
+def test_composition_parquet_zmw_strand_distinct_values_recoverable(tmp_path):
+    """All 200 distinct zmw_strand values survive the parquet round-trip."""
+    n_ccs = 200
+    path = tmp_path / "distinct.parquet"
+    _write_high_cardinality_composition(path, n_ccs=n_ccs)
+
+    table = pq.read_table(path)
+    distinct = set(table.column("zmw_strand").to_pylist())
+    assert distinct == {f"{i}_fwd" for i in range(n_ccs)}

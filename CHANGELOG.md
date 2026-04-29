@@ -2,6 +2,11 @@
 
 <!--next-version-placeholder-->
 
+## v0.7.1 (28/04/2026)
+
+- Fix `pyarrow.lib.ArrowInvalid: Integer value 128 not in range: -128 to 127` when reading the streamed composition parquet at scale. `zmw_strand` was written as a per-CCS 1-cardinality `pd.Categorical`, which `pa.Table.from_pandas` infers as `dict<int8, string>` and bakes into the parquet `ARROW:schema` footer. After concat into row groups, the on-disk dictionary held 100+ distinct values but readers trusted the int8 footer claim and overflowed at index 128. `zmw_strand` now writes as a plain string column. Other categoricals (`strand`, `ccs_base`, `reference_base`) are unchanged: their cardinalities are bounded at 2-5.
+- v0.7.0-written composition parquets are unreadable and must be regenerated.
+
 ## v0.7.0 (24/04/2026)
 
 - `alignment.process_subread_alignment` gains `n_buckets: int = 1`. When `n_buckets > 1`, `output_path` is treated as a directory and assigned-subread rows are sharded across `bucket_{i:02d}.parquet` files keyed by `zmw % n_buckets`. A `manifest.json` (`{"n_buckets": N, "schema_version": "0.7", "has_margin": bool}`) is written last as the atomic completion marker — readers must refuse to proceed without it. Per-bucket flush threshold is `_ASSIGNED_SUBREAD_FLUSH_ROWS // n_buckets`, so total write-side buffered rows stays bounded at ~100k regardless of N (otherwise 16 independent 100k-row buffers at full scale would hold ~48 GB of `aligned_sequence` across all buckets). Default `n_buckets=1` preserves the single-file write path byte-for-byte.

@@ -126,9 +126,10 @@ def calculate_base_composition(
 
     ccs_base = pd.Categorical(list(ccs_seq), categories=_BASE_CATEGORIES)
     strand = pd.Categorical([ccs_read["strand"]] * ccs_len, categories=_STRAND_CATEGORIES)
-    zmw_strand = pd.Categorical(
-        [ccs_read["zmw_strand"]] * ccs_len, categories=[ccs_read["zmw_strand"]]
-    )
+    # Plain string, not Categorical: per-CCS singleton Categoricals infer
+    # `dict<int8, string>` and overflow downstream readers past 127 distinct
+    # values per row group. Bounded-cardinality columns above stay Categorical.
+    zmw_strand = [ccs_read["zmw_strand"]] * ccs_len
 
     df = pd.DataFrame(
         {
