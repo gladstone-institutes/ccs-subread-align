@@ -32,6 +32,8 @@ def ccs_zmws():
     zmws = set()
     with pysam.AlignmentFile(str(CCS_BAM), "rb") as bam:
         for read in bam.fetch():
+            if read.is_secondary or read.is_supplementary:
+                continue
             parts = read.query_name.split("/")
             if len(parts) >= 2:
                 try:

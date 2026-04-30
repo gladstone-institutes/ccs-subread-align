@@ -2,6 +2,10 @@
 
 <!--next-version-placeholder-->
 
+## v0.7.2 (30/04/2026)
+
+- Fix duplicate `(zmw, strand, ref_pos)` rows in the composition parquet caused by `stream_ccs_reads` and `scan_zmw_to_chrom` yielding both the primary and supplementary BAM records of CCS reads that wrap the circular mtDNA origin. Both sites now skip `read.is_secondary` and `read.is_supplementary`. Affects any pipeline whose upstream aligner produced split alignments at the chrM origin; composition parquets generated with v0.7.0–v0.7.1 against such BAMs should be regenerated.
+
 ## v0.7.1 (28/04/2026)
 
 - Fix `pyarrow.lib.ArrowInvalid: Integer value 128 not in range: -128 to 127` when reading the streamed composition parquet at scale. `zmw_strand` was written as a per-CCS 1-cardinality `pd.Categorical`, which `pa.Table.from_pandas` infers as `dict<int8, string>` and bakes into the parquet `ARROW:schema` footer. After concat into row groups, the on-disk dictionary held 100+ distinct values but readers trusted the int8 footer claim and overflowed at index 128. `zmw_strand` now writes as a plain string column. Other categoricals (`strand`, `ccs_base`, `reference_base`) are unchanged: their cardinalities are bounded at 2-5.

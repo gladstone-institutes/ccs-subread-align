@@ -57,6 +57,8 @@ def scan_zmw_to_chrom(
     t0 = time.monotonic()
     with pysam.AlignmentFile(ccs_bam_path, "rb") as bam:
         for read in tqdm(bam.fetch(), desc="Scan zmw→chrom", unit="reads"):
+            if read.is_secondary or read.is_supplementary:
+                continue
             zmw = extract_zmw_from_name(read.query_name)
             if zmw in zmw_set and zmw not in mapping:
                 mapping[zmw] = read.reference_name
@@ -91,6 +93,8 @@ def stream_ccs_reads(
     yielded = 0
     with pysam.AlignmentFile(ccs_bam_path, "rb") as bam:
         for read in tqdm(bam.fetch(), desc="Streaming CCS reads", unit="reads"):
+            if read.is_secondary or read.is_supplementary:
+                continue
             zmw = extract_zmw_from_name(read.query_name)
             if zmw not in zmw_set:
                 continue
