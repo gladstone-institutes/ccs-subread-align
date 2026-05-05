@@ -2,6 +2,10 @@
 
 <!--next-version-placeholder-->
 
+## v0.7.3 (05/05/2026)
+
+- Fix duplicate `(zmw, strand, ref_pos)` rows in the composition parquet for concatemer / rolling-circle CCS reads (e.g. phi29 MDA on circular templates), where two `ccs_pos` map to the same canonical `ref_pos` after `parse_cigar_to_reference_map` applies `% chrM_length`. Counts on these rows are byte-identical, so `calculate_base_composition` now keeps the first occurrence by default. New `collapse_duplicate_positions` keyword on both `calculate_base_composition` and `calculate_all_base_compositions` (default `True`); pass `False` to retain one row per `ccs_pos` for per-pass inspection. Insertions / soft clips (`ref_pos == -1`) are always preserved.
+
 ## v0.7.2 (30/04/2026)
 
 - Fix duplicate `(zmw, strand, ref_pos)` rows in the composition parquet caused by `stream_ccs_reads` and `scan_zmw_to_chrom` yielding both the primary and supplementary BAM records of CCS reads that wrap the circular mtDNA origin. Both sites now skip `read.is_secondary` and `read.is_supplementary`. Affects any pipeline whose upstream aligner produced split alignments at the chrM origin; composition parquets generated with v0.7.0–v0.7.1 against such BAMs should be regenerated.

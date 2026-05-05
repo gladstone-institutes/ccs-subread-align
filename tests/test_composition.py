@@ -125,6 +125,48 @@ def test_base_composition_insertion_positions():
     assert df.iloc[2]["total_subreads"] == 0
 
 
+def test_base_composition_collapses_duplicate_ref_pos():
+    # Concatemer-style CCS: ccs_pos 4..7 revisit canonical ref_pos 0..3.
+    ccs = _make_ccs_read("ACGTACGT")
+    ccs["query_to_ref"] = np.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int32)
+    sr = _make_subread("ACGT", [0, 1, 2, 3])
+    ref_seq = "ACGT" * 5000
+    df = calculate_base_composition(ccs, [sr], ref_seq, CHRM_LENGTH)
+    assert len(df) == 4
+    assert df["ref_pos"].tolist() == [0, 1, 2, 3]
+    assert df["ccs_pos"].tolist() == [0, 1, 2, 3]
+    assert (df["total_subreads"] == 1).all()
+    assert (df["agreement_fraction"] == 1.0).all()
+
+
+def test_base_composition_no_collapse_keeps_per_ccs_pos():
+    ccs = _make_ccs_read("ACGTACGT")
+    ccs["query_to_ref"] = np.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int32)
+    sr = _make_subread("ACGT", [0, 1, 2, 3])
+    ref_seq = "ACGT" * 5000
+    df = calculate_base_composition(
+        ccs, [sr], ref_seq, CHRM_LENGTH, collapse_duplicate_positions=False
+    )
+    assert len(df) == 8
+    assert df["ccs_pos"].tolist() == list(range(8))
+    assert df["ref_pos"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+    # Every ccs_pos in ref_to_ccs[ref_pos] is incremented per subread base,
+    # so both passes carry the same count.
+    assert (df["total_subreads"] == 1).all()
+
+
+def test_base_composition_collapse_preserves_insertions():
+    # Two insertions and a duplicated ref_pos in the same read.
+    ccs = _make_ccs_read("ACGTAC")
+    ccs["query_to_ref"] = np.array([0, 1, -1, 3, 0, -1], dtype=np.int32)
+    sr = _make_subread("ACT", [0, 1, 3])
+    ref_seq = "ACGT" * 5000
+    df = calculate_base_composition(ccs, [sr], ref_seq, CHRM_LENGTH)
+    # Three canonical ref_pos kept (0, 1, 3) plus two -1 rows preserved.
+    assert df["ref_pos"].tolist() == [0, 1, -1, 3, -1]
+    assert df["ccs_pos"].tolist() == [0, 1, 2, 3, 5]
+
+
 # --- calculate_all_base_compositions ---
 
 
@@ -188,6 +230,10 @@ def test_calculate_all_base_compositions_integration():
     covered = df[df["total_subreads"] > 0]
     assert len(covered) > 0
     assert covered["agreement_fraction"].mean() > 0.8
+    # (zmw, strand, ref_pos) is unique on canonical positions under the
+    # default collapse_duplicate_positions=True.
+    canonical = df[df["ref_pos"] != -1]
+    assert not canonical.duplicated(subset=["zmw", "strand", "ref_pos"]).any()
 
 
 @pytest.mark.skipif(

@@ -39,6 +39,8 @@ def calculate_base_composition(
     assigned_subreads: List[Dict],
     ref_seq: str,
     chrM_length: int = 16569,
+    *,
+    collapse_duplicate_positions: bool = True,
 ) -> pd.DataFrame:
     """
     Calculate per-position base composition from subreads aligned to a CCS read.
@@ -59,11 +61,24 @@ def calculate_base_composition(
             position_map.
         ref_seq: Reference sequence for this chromosome.
         chrM_length: Genome length for coordinate normalization.
+        collapse_duplicate_positions: When ``True`` (default), drop rows whose
+            ``ref_pos`` duplicates an earlier row, keeping the first
+            occurrence. Concatemer / rolling-circle CCS reads (e.g. phi29 MDA
+            on circular templates) can map two ``ccs_pos`` to the same
+            canonical ``ref_pos`` after the ``% chrM_length`` normalization in
+            ``parse_cigar_to_reference_map``; counts on the duplicate rows are
+            identical, so collapsing yields one row per ``(zmw, strand, ref_pos)``
+            as downstream consumers expect. Insertions / soft clips
+            (``ref_pos == -1``) are always preserved. Set to ``False`` to retain
+            one row per ``ccs_pos`` for per-pass inspection.
 
     Returns:
-        DataFrame with one row per CCS position and columns: zmw, strand, zmw_strand,
-        ccs_pos, ref_pos, ccs_base, reference_base, q_score, A_count, T_count,
-        C_count, G_count, N_count, total_subreads, agreement_fraction.
+        DataFrame with columns: zmw, strand, zmw_strand, ccs_pos, ref_pos,
+        ccs_base, reference_base, q_score, A_count, T_count, C_count, G_count,
+        N_count, total_subreads, agreement_fraction. With the default
+        ``collapse_duplicate_positions=True``, rows are unique by ``ref_pos``
+        within the read (except ``ref_pos == -1``); with ``False`` there is
+        one row per ``ccs_pos``.
     """
     ccs_len = ccs_read["query_length"]
     ccs_to_ref = ccs_read.get("query_to_ref")
@@ -151,14 +166,29 @@ def calculate_base_composition(
         }
     )
 
+    if collapse_duplicate_positions:
+        # Concatemer reads can map multiple ccs_pos to the same canonical
+        # ref_pos via `% chrM_length`; counts are identical on the duplicates,
+        # so keep the first. ref_pos == -1 (insertions, soft clips) is not a
+        # canonical position and is preserved.
+        keep = (df["ref_pos"] == -1) | ~df.duplicated(subset="ref_pos", keep="first")
+        if not keep.all():
+            df = df[keep].reset_index(drop=True)
+
     return df
 
 
 def _process_ccs_composition(args: Tuple) -> Optional[pd.DataFrame]:
     """Worker function for parallel base composition calculation."""
-    ccs, zmw_strand_subreads, ref_seq, chrM_length = args
+    ccs, zmw_strand_subreads, ref_seq, chrM_length, collapse = args
     if len(zmw_strand_subreads) > 0:
-        return calculate_base_composition(ccs, zmw_strand_subreads, ref_seq, chrM_length)
+        return calculate_base_composition(
+            ccs,
+            zmw_strand_subreads,
+            ref_seq,
+            chrM_length,
+            collapse_duplicate_positions=collapse,
+        )
     return None
 
 
@@ -278,6 +308,7 @@ def _iter_dfs_for_stream(
     chrM_length: int,
     n_cores: int,
     desc: str,
+    collapse_duplicate_positions: bool,
 ) -> Iterator[Optional[pd.DataFrame]]:
     """Drive ``_iter_worker_dfs`` from a single CCS stream.
 
@@ -297,7 +328,13 @@ def _iter_dfs_for_stream(
                 matched = _pa_table_to_subread_dicts(group)
             else:
                 matched = group
-            yield (ccs, matched, ref_seqs[chrom], chrM_length)
+            yield (
+                ccs,
+                matched,
+                ref_seqs[chrom],
+                chrM_length,
+                collapse_duplicate_positions,
+            )
 
     # total=None: ccs stream is walked once, so tqdm shows rate + elapsed
     # instead of a percent.
@@ -316,6 +353,7 @@ def _iter_bucket_dfs(
     zmw_to_chrom: Dict[int, str],
     chrM_length: int,
     n_cores: int,
+    collapse_duplicate_positions: bool,
 ) -> Iterator[Optional[pd.DataFrame]]:
     """Iterate buckets in index order, yielding composition DataFrames.
 
@@ -341,6 +379,7 @@ def _iter_bucket_dfs(
         yield from _iter_dfs_for_stream(
             filtered, subreads, True, ref_seqs, zmw_to_chrom,
             chrM_length, n_cores, f"Bucket {i}/{n_buckets - 1}",
+            collapse_duplicate_positions,
         )
         # Explicit drop + collect: pyarrow buffers are reference-counted,
         # and dropping the dict now (rather than waiting for generator
@@ -358,6 +397,8 @@ def calculate_all_base_compositions(
     chrM_length: int = 16569,
     n_cores: Optional[int] = None,
     output_path: Optional[Union[str, Path]] = None,
+    *,
+    collapse_duplicate_positions: bool = True,
 ) -> Union[pd.DataFrame, Path]:
     """
     Calculate base composition for all CCS reads.
@@ -384,6 +425,11 @@ def calculate_all_base_compositions(
             (zstd-compressed) and return the path. Avoids materializing the
             full DataFrame in memory, which OOMs on full-scale data. If None,
             return a single concatenated DataFrame (only safe at small scale).
+        collapse_duplicate_positions: Forwarded to ``calculate_base_composition``;
+            see that function for details. Default ``True`` produces one row
+            per ``(zmw, strand, ref_pos)`` (except ``ref_pos == -1``), which is
+            what concatemer / rolling-circle CCS reads need to keep that key
+            unique.
 
     Returns:
         DataFrame with base composition at all positions across all CCS reads,
@@ -420,7 +466,7 @@ def calculate_all_base_compositions(
         )
         df_iter = _iter_bucket_dfs(
             bucket_dir, manifest, ccs_reads, ref_seqs, zmw_to_chrom,
-            chrM_length, n_cores,
+            chrM_length, n_cores, collapse_duplicate_positions,
         )
     else:
         subreads_by_zmw_strand: Dict[Tuple[int, str], Union[List[Dict], pa.Table]]
@@ -443,6 +489,7 @@ def calculate_all_base_compositions(
         df_iter = _iter_dfs_for_stream(
             source, subreads_by_zmw_strand, from_parquet, ref_seqs,
             zmw_to_chrom, chrM_length, n_cores, desc,
+            collapse_duplicate_positions,
         )
 
     if output_path is not None:
